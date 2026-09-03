@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "coord_sys": "k4a_color_cam_meters_v1",
+  "camera_id": "cam_0",
+  "frame_id": 42,
+  "ts_ns_wall": 1710000000000000000,
+  "ts_ns_mono": 123456789000,
+  "points": [
+    {
+      "id": "neon_pink",
+      "pos": { "x": 0.12, "y": -0.45, "z": 1.23 }
+    },
+    {
+      "id": "neon_green",
+      "pos": { "x": 0.30, "y": -0.40, "z": 1.10 }
+    },
+    {
+      "id": "neon_yellow",
+      "pos": { "x": -0.10, "y": -0.50, "z": 1.20 }
+    },
+    {
+      "id": "neon_blue",
+      "pos": { "x": 0.05, "y": -0.48, "z": 1.15 }
+    }
+  ]
+}

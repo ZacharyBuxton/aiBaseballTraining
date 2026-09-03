@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "coord_sys": "synthetic_test_frame",
+  "camera_id": "dummy_cam",
+  "frame_id": 7,
+  "ts_ns_wall": 1710000000000000000,
+  "ts_ns_mono": 987654321000,
+  "points": [
+    {
+      "id": "neon_pink",
+      "pos": { "x": 0.1, "y": 0.0, "z": 1.0 }
+    },
+    {
+      "id": "neon_green",
+      "pos": { "x": 0.0, "y": 0.1, "z": 1.0 }
+    },
+    {
+      "id": "neon_yellow",
+      "pos": { "x": -0.1, "y": 0.0, "z": 1.0 }
+    }
+  ]
+}

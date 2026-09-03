@@ -1,0 +1,31 @@
+# DC-KFT (Dual-Camera Kinematic Fusion Tracker) — Python dependencies
+#
+# Each subsystem folder (Cameras/, IMU/, Data Processing/, Rendering/) has a legacy/ subfolder
+# holding pre-pivot scripts that target hardware (Azure Kinect, a specific Windows-only IMU
+# driver) the current pivot no longer uses. Install with: pip install -r requirements.txt
+
+# ---- Core (used by both new subsystem code and legacy/ scripts) ----
+numpy>=1.26
+scipy>=1.11
+pyzmq>=25.1
+
+# ---- Optical / computer vision ----
+opencv-python>=4.9
+
+# ---- Telemetry / serial & radio ----
+pyserial>=3.5
+pyserial-asyncio>=0.6      # IMU/legacy/imu_data_collection.py (asyncio serial reader)
+scikit-learn>=1.4          # IMU/legacy uses sklearn.linear_model.LinearRegression
+
+# ---- New hardware pivot (Cameras/, IMU/) ----
+# The single stereo 120 fps camera and 900 MHz radio receiver haven't been finalized yet, so
+# their vendor SDK / driver packages aren't pinned here. Add them once hardware is selected
+# (see docs/background.md).
+
+# ---- Legacy-only (previous group's Azure Kinect pipeline) ----
+# pykinect-azure          # Cameras/legacy/Device_Tracking_2_16.py — requires the Azure Kinect
+#                          # SDK (K4A) to be installed separately; only needed to run legacy code
+#                          # against the old dual-Kinect rig, not for new development.
+
+# ---- Testing ----
+pytest>=8.0

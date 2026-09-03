@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Captured data / logs (large or run-specific; do not commit raw captures)
+reports/
+*.jsonl
+*.csv
+*.mp4
+*.avi
+*.mkv
+
+# MATLAB
+*.asv
+*.m~
+
+# Env / secrets
+.env
+*.pem
+*.key
