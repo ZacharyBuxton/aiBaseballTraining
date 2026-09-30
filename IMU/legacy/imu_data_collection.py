@@ -268,6 +268,10 @@ async def main():
     # initialize the com port for data collection
     foundPorts = get_ports()
     connectPort = findArduino(foundPorts)
+    # Optional: force a specific port, e.g. `python imu_data_collection.py COM3`
+    # (auto-detect picks the last USB port, which is wrong when the tracker is also plugged in by USB)
+    if len(sys.argv) > 1:
+        connectPort = sys.argv[1]
     print(foundPorts)
     print(connectPort)
 
