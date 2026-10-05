@@ -18,7 +18,7 @@ from stereo import StereoCalib, depth_error, match_and_triangulate, triangulate
 
 H, W = 600, 960                       # ZED X SVGA
 CALIB = StereoCalib(fx=700.0, fy=700.0, cx=480.0, cy=300.0, baseline_m=0.12, width=W, height=H)
-HUES = {"neon_pink": 170, "magenta": 160, "neon_yellow": 34}   # from MARKER_HEX
+HUES = {"neon_pink": 170, "magenta": 160, "neon_yellow": 32}   # from MARKER_HEX
 
 
 def hue_to_bgr(h):
@@ -59,7 +59,7 @@ def test_detects_each_marker_with_subpixel_accuracy():
 
 
 def test_hex_codes_convert_to_expected_hues():
-    assert MARKER_HEX == {"neon_yellow": "#DFFF00", "magenta": "#C9218F", "neon_pink": "#FF256B"}
+    assert MARKER_HEX == {"neon_yellow": "#D6E03D", "magenta": "#C9218F", "neon_pink": "#FF256B"}
     assert {m: hex_to_hue(h) for m, h in MARKER_HEX.items()} == HUES
     assert MarkerConfig().hues == {m: [h] for m, h in HUES.items()}
 
