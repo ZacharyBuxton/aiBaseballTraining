@@ -30,7 +30,7 @@ from typing import Dict, List, Optional
 # Colors of the tape/markers on the bat -- the single source of truth for what the
 # camera looks for. Marker ids double as the point ids in the published payload.
 MARKER_HEX: Dict[str, str] = {
-    "neon_yellow": "#DFFF00",   # Neon Yellow
+    "neon_yellow": "#D6E03D",   # Yellow-green
     "magenta":     "#C9218F",   # Magenta
     "neon_pink":   "#FF256B",   # Neon Pink
 }
@@ -60,7 +60,7 @@ class CameraConfig:
 @dataclass
 class MarkerConfig:
     # OpenCV HSV hue centers (0-179) for each marker, derived from MARKER_HEX above
-    # (yellow ~34, magenta ~160, pink ~170). Marker ids match the point ids the pose
+    # (yellow-green ~32, magenta ~160, pink ~170). Marker ids match the point ids the pose
     # solver ("Data Processing/legacy/Quaternion_Scheme_12_2.py") looks up in its MODEL dict.
     # Magenta and pink are only ~10 hue units apart, so hue_tol is kept tight (4) to stop
     # their masks overlapping. Re-tune under cage lighting.
