@@ -22,9 +22,25 @@ can be committed and reused:
 
 from __future__ import annotations
 
+import colorsys
 import json
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
+
+# Colors of the tape/markers on the bat -- the single source of truth for what the
+# camera looks for. Marker ids double as the point ids in the published payload.
+MARKER_HEX: Dict[str, str] = {
+    "neon_yellow": "#DFFF00",   # Neon Yellow
+    "magenta":     "#C9218F",   # Magenta
+    "neon_pink":   "#FF256B",   # Neon Pink
+}
+
+
+def hex_to_hue(hex_color: str) -> int:
+    """'#RRGGBB' -> OpenCV hue (0-179)."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    return int(round(colorsys.rgb_to_hsv(r, g, b)[0] * 180.0)) % 180
 
 
 @dataclass
@@ -43,17 +59,14 @@ class CameraConfig:
 
 @dataclass
 class MarkerConfig:
-    # OpenCV HSV hue centers (0-179) for each marker. Keys match the MODEL dict in
-    # "Data Processing/legacy/Quaternion_Scheme_12_2.py" so its pose solver can
-    # consume our payloads unchanged. Values come from the previous team's tuning
-    # (pink wraps around 0/180, hence several centers). Re-tune under cage lighting.
-    hues: Dict[str, List[int]] = field(default_factory=lambda: {
-        "neon_pink":   [165, 175, 5, 15],
-        "neon_green":  [55, 65, 75],
-        "neon_yellow": [28, 25, 30],
-        "neon_blue":   [105, 95, 115],
-    })
-    hue_tol: int = 10
+    # OpenCV HSV hue centers (0-179) for each marker, derived from MARKER_HEX above
+    # (yellow ~34, magenta ~160, pink ~170). Marker ids match the point ids the pose
+    # solver ("Data Processing/legacy/Quaternion_Scheme_12_2.py") looks up in its MODEL dict.
+    # Magenta and pink are only ~10 hue units apart, so hue_tol is kept tight (4) to stop
+    # their masks overlapping. Re-tune under cage lighting.
+    hues: Dict[str, List[int]] = field(
+        default_factory=lambda: {m: [hex_to_hue(hx)] for m, hx in MARKER_HEX.items()})
+    hue_tol: int = 4
     s_min: int = 150
     s_max: int = 255
     v_min: int = 120
