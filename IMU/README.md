@@ -1,28 +1,29 @@
 # IMU / Telemetry Subsystem
 
-## Status: electronics likely carry over; link layer is changing
+**Current code: `dckft/imu/`.** The cross-platform reader for the 900 MHz radio receiver.
 
-The custom IMU sensor (ICM45686 + ADXL375 chipset, built by Dr. Jupina) was inherited from the
-previous capstone team and is still in the current team's possession — so unlike the camera
-schema, this hardware itself probably isn't being replaced. What **is** changing, per the
-September 2026 pivot (see `../docs/background.md`), is the telemetry link: the project is moving
-to a **900 MHz radio receiver**, which may replace or sit alongside the serial/COM-port link the
-legacy script below uses. Treat the data-format and frame-validation logic here as reusable;
-treat the transport layer (`pyserial_asyncio` over a Windows COM port) as likely needing
-replacement to match the new radio hardware.
+- **Sensor:** ICM45686 + ADXL375 board (built by Dr. Jupina), worn on the **wrist**.
+- **Link:** the radio carries the same 30-byte frames as the old serial link: 921600 baud, 400 Hz.
+
+```bash
+python -m dckft.imu.reader --list-ports
+python -m dckft.imu.reader --port /dev/ttyUSB0 --csv sessions/imu.csv      # also publishes ZMQ :5558
+python -m dckft.imu.reader --calibrate 3                                    # gyro bias at rest
+python -m dckft.imu.reader --replay reports/ICM45686_and_ADXL375_test_data_2026-09-30_16-10-23.csv
+```
+
+## What changed from `legacy/imu_data_collection.py`
+
+- **Cross-platform.** No `ctypes.windll` and no hard-coded `COM10`. The port is auto-detected, or set
+  with `--port`.
+- **Resync.** A bad byte costs one frame. The old reader threw away its whole buffer.
+- **Timestamps.** Every sample carries a host `ts_ns_host` (Jetson clock) for camera fusion.
+  `dckft.data` regresses it against the device µs counter to remove USB batching jitter.
+- **Run length.** It runs until Ctrl+C or `--samples/--seconds`, not a fixed 2400 samples.
+- **Same CSV columns** as before, plus `ts_ns_host`. Old CSVs still load; fusion then relies on
+  cross-correlation alone.
 
 ## Contents
 
-- `legacy/imu_data_collection.py` — reads IMU frames over a serial connection at 921600 baud
-  (30-byte frames, validated by a status word), converts to physical accel/gyro units via
-  hard-coded scale factors, and writes to CSV. Windows-only as written (uses `ctypes.windll` and
-  a hard-coded `COM10` port).
-- `legacy/INSTRUCTIONS.md` — the previous group's setup notes, including a note that this script
-  only runs from `cmd`, not from inside VS Code.
-
-## New work (once the 900 MHz radio link is finalized)
-
-New telemetry ingestion code will live directly in this folder. It should reuse the frame
-validation and unit-conversion logic from the legacy script where it still applies, but replace
-the transport with whatever the 900 MHz radio receiver exposes (raw serial, a vendor SDK, etc.),
-and should be made cross-platform rather than Windows-only.
+- **`reports/`:** a sample capture from 2026-09-30 (bench, then hand motion).
+- **`legacy/`:** the previous team's Windows reader and setup notes, kept for reference.
