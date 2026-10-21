@@ -48,3 +48,8 @@ reports/
 .env
 *.pem
 *.key
+
+# Session recordings (camera JSONL, IMU CSV, renders)
+sessions/
+*.svo2
+*.svo

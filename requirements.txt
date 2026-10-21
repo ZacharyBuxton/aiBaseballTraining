@@ -1,4 +1,4 @@
-# DC-KFT (Dual-Camera Kinematic Fusion Tracker) — Python dependencies
+# DC-KFT (Kinematic Fusion Tracker) — Python dependencies
 #
 # Each subsystem folder (Cameras/, IMU/, Data Processing/, Rendering/) has a legacy/ subfolder
 # holding pre-pivot scripts that target hardware (Azure Kinect, a specific Windows-only IMU
@@ -6,8 +6,12 @@
 
 # ---- Core (used by both new subsystem code and legacy/ scripts) ----
 numpy>=1.26
-scipy>=1.11
+scipy>=1.11                # >=1.10 needed for make_smoothing_spline (dckft.trajectory)
 pyzmq>=25.1
+pandas>=2.0                # CSV loading (dckft.data, Data Processing/fuse_imu_camera_data.py)
+
+# ---- Rendering (dckft.render) ----
+matplotlib>=3.7            # 3D swing replay window; ffmpeg (apt) optional for --mp4
 
 # ---- Optical / computer vision ----
 opencv-python>=4.9
@@ -17,10 +21,10 @@ pyserial>=3.5
 pyserial-asyncio>=0.6      # IMU/legacy/imu_data_collection.py (asyncio serial reader)
 scikit-learn>=1.4          # IMU/legacy uses sklearn.linear_model.LinearRegression
 
-# ---- New hardware pivot (Cameras/, IMU/) ----
-# The single stereo 120 fps camera and 900 MHz radio receiver haven't been finalized yet, so
-# their vendor SDK / driver packages aren't pinned here. Add them once hardware is selected
-# (see docs/background.md).
+# ---- Camera SDK ----
+# pyzed (ZED SDK Python API) is NOT on PyPI: install it from the ZED SDK
+# (python /usr/local/zed/get_python_api.py) -- see Cameras/README.md. Only Cameras/ needs it;
+# dckft and the tests run without it.
 
 # ---- Legacy-only (previous group's Azure Kinect pipeline) ----
 # pykinect-azure          # Cameras/legacy/Device_Tracking_2_16.py — requires the Azure Kinect
