@@ -18,8 +18,13 @@ Pipeline per frame:
 The same code runs on the live camera or on a recorded .svo2 (--svo). If live
 processing can't keep up with 120 fps, record first and process the recording:
 
-    python Cameras/track_bat.py --record reports/swing01.svo2 --no-zmq     # capture
+    python Cameras/track_bat.py --record reports/swing01.svo2 --record-only   # capture, no detection
     python Cameras/track_bat.py --svo reports/swing01.svo2 --jsonl reports/swing01.jsonl
+
+--record-only skips marker detection entirely (fastest, no dropped frames from processing) and
+writes <svo>.meta.json with the camera info, calibration and the ZED IMU gravity estimate. When
+that SVO is processed later, the gravity estimate is carried into the JSONL's .meta.json.
+`python -m dckft.run capture` runs this together with the IMU reader for you.
 
 Other examples:
     python Cameras/track_bat.py --preview                    # live, publish on :5557
@@ -54,6 +59,8 @@ def parse_args():
     p.add_argument("--save-config", help="Write the effective config to this path and continue")
     p.add_argument("--svo", help="Process a recorded .svo2 instead of the live camera")
     p.add_argument("--record", help="Record the live session to this .svo2 path")
+    p.add_argument("--record-only", action="store_true",
+                   help="With --record: only record (no detection/publishing); fastest capture")
     p.add_argument("--codec", default="h265", choices=sorted(ZedCamera.RECORD_CODECS),
                    help="SVO codec (use lossless-cpu on an Orin Nano)")
     p.add_argument("--depth-source", choices=("stereo", "sdk"), default="stereo")
@@ -89,6 +96,42 @@ def apply_overrides(cfg, args):
     return cfg
 
 
+def record_only(cam, cfg, args) -> int:
+    """Record the live camera to an SVO as fast as possible; detection happens later."""
+    info = cam.info()
+    os.makedirs(os.path.dirname(os.path.abspath(args.record)), exist_ok=True)
+    gravity = cam.estimate_gravity(0.5)
+    with open(args.record + ".meta.json", "w") as f:
+        json.dump({"camera": info, "calibration": cam.calibration().to_dict(), "gravity": gravity,
+                   "config": cfg.to_dict(), "record": args.record, "codec": args.codec},
+                  f, indent=2, default=str)
+    cam.start_recording(args.record, codec=args.codec)
+    print(f"Recording {info['resolution'][0]}x{info['resolution'][1]} @ {info['fps']:.0f} fps to "
+          f"{args.record} ({args.codec}). Ctrl+C to stop.")
+    n, drops0, t_last = 0, cam.dropped_frames(), time.monotonic()
+    ts = deque(maxlen=240)
+    try:
+        while True:
+            t = cam.grab_timestamp_only()
+            if t is None:
+                break
+            n += 1
+            ts.append(t)
+            if not args.quiet and time.monotonic() - t_last >= 1.0:
+                t_last = time.monotonic()
+                fps = (len(ts) - 1) / ((ts[-1] - ts[0]) / 1e9) if len(ts) > 1 else 0.0
+                print(f"recorded {n} frames | fps {fps:6.1f} | dropped {cam.dropped_frames() - drops0}")
+            if args.max_frames and n >= args.max_frames:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        dropped = cam.dropped_frames() - drops0
+        cam.close()                     # also finalises the recording
+    print(f"Saved {n} frames to {args.record} (dropped {dropped})")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     cfg = apply_overrides(load_config(args.config), args)
@@ -102,6 +145,13 @@ def main() -> int:
     except CameraError as e:
         print(f"[FAIL] {e}")
         return 1
+
+    if args.record_only:
+        if not args.record or args.svo:
+            print("[FAIL] --record-only needs --record and a live camera")
+            cam.close()
+            return 1
+        return record_only(cam, cfg, args)
 
     publisher = jsonl = None
     n_frames = n_published = 0
@@ -118,6 +168,9 @@ def main() -> int:
             print_depth_budget(calib, distances=(2.0, 3.0, 4.0))
 
         gravity = cam.estimate_gravity(0.5) if not args.svo else None
+        if gravity is None and args.svo and os.path.exists(args.svo + ".meta.json"):
+            with open(args.svo + ".meta.json") as f:       # written by --record-only
+                gravity = json.load(f).get("gravity")
 
         if cfg.output.zmq_bind:
             publisher = FramePublisher(cfg.output.zmq_bind)

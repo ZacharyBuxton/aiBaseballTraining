@@ -78,7 +78,8 @@ python Cameras/track_bat.py --preview --exposure-us 700 --save-config Cameras/ca
 python Cameras/track_bat.py --config Cameras/cage.json
 
 # Record-then-process (recommended until live speed is proven on the Jetson)
-python Cameras/track_bat.py --record reports/swing01.svo2 --no-zmq --quiet
+python Cameras/track_bat.py --record reports/swing01.svo2 --record-only   # no detection while recording
+# (python -m dckft.run capture does this together with the IMU and processes afterwards)
 python Cameras/track_bat.py --svo reports/swing01.svo2 --jsonl reports/swing01.jsonl
 
 # Cross-check the stereo path against the SDK's neural depth

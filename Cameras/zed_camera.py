@@ -225,6 +225,20 @@ class ZedCamera:
         self.recording = False
 
     # --------------------------------------------------------------------- grab
+    def grab_timestamp_only(self) -> Optional[int]:
+        """
+        Grab without retrieving images (record-only capture). The SDK still writes the frame to
+        the SVO when recording is on; skipping retrieve/convert keeps the loop well inside the
+        8.3 ms budget at 120 fps. Returns the image timestamp in ns, or None at the end of an SVO.
+        """
+        err = self.cam.grab(self.runtime)
+        if err == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
+            return None
+        if not _ok(err):
+            raise CameraError(f"grab() failed: {err}")
+        self._frame_id += 1
+        return self.cam.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
+
     def grab(self) -> Optional[Frame]:
         """
         Blocks until the next frame. Returns None at the end of an SVO file.
