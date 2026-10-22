@@ -216,3 +216,66 @@ def test_legacy_sample_capture_loads():
     assert abs(np.median(np.linalg.norm(imu.accel[still], axis=1)) - 9.81) < 0.5
     assert np.median(np.linalg.norm(imu.gyro[still], axis=1)) < 0.1
     assert abs(np.median(np.diff(imu.t)) - 0.0025) < 1e-4      # 400 Hz
+
+
+# ------------------------------------------------------------------ smoother / markers / capture
+def test_smoother_helps_inside_camera_gaps(tmp_path):
+    """Long occlusion before contact: the RTS pass should beat forward-only coasting there."""
+    errs = {False: [], True: []}
+    for seed in (20, 21, 22):
+        sim = simulate(SimParams(seed=seed, flex_deg=0.0, occlusion_frames=8, gyro_bias_std=0.08))
+        p = write_session(sim, str(tmp_path / f"s{seed}"))
+        cam, imu = load_camera_jsonl(p["camera"]), load_imu_csv(p["imu"])
+        tr, tc = sim["truth_traj"], sim["truth"]["t_contact"]
+        for smooth in (False, True):
+            cfg = FusionConfig(); cfg.ekf.smooth = smooth; cfg.flex_lam = None
+            res = process_swing(cam, imu, cfg)
+            assert res.ekf.smoothed == smooth
+            t = res.ekf.t
+            m = (t >= tc - 8 / 120) & (t <= tc)
+            ut = np.column_stack([np.interp(t[m], tr.t, tr.axis[:, j]) for j in range(3)])
+            errs[smooth].append(np.degrees(np.arccos(np.clip(np.sum(res.ekf.axis[m] * ut, 1), -1, 1))).mean())
+    assert np.mean(errs[True]) < np.mean(errs[False])
+
+
+def test_marker_gap_filling(sim_session, tmp_path):
+    sim, paths = sim_session
+    cfg = FusionConfig()
+    res = process_swing(load_camera_jsonl(paths["camera"]), load_imu_csv(paths["imu"]), cfg)
+    mf = res.markers
+    assert set(mf.tracks) == set(cfg.bat.marker_s_m)
+    tr = sim["truth_traj"]
+    win = (mf.t_cam >= res.swing.t_onset) & (mf.t_cam <= res.swing.t_end)
+    n_gap = 0
+    for mid, track in mf.tracks.items():
+        true = tr.knob + cfg.bat.marker_s_m[mid] * tr.axis
+        tt = np.column_stack([np.interp(mf.t_cam, tr.t, true[:, j]) for j in range(3)])
+        gap = win & ~track.cam_seen
+        n_gap += int(gap.sum())
+        if gap.any():   # IMU-filled positions: a few cm while the bat moves ~25 cm per frame
+            e = np.linalg.norm(track.cam_filled[gap] - tt[gap], axis=1)
+            assert np.median(e) < 0.03 and e.max() < 0.05
+        assert np.isfinite(track.filled).all()
+    assert n_gap > 0       # the simulator always occludes frames before contact
+    summ = res.diagnostics()["markers"]
+    assert all(s["frames_filled"] >= 0 and s["residual_rms_mm"] < 30 for s in summ.values())
+    res.save(str(tmp_path), cfg.bat)
+    lines = (tmp_path / "camera_filled.jsonl").read_text().splitlines()
+    first = json.loads(lines[0])
+    assert len(first["points"]) == 3 and {p["source"] for p in first["points"]} <= {"camera", "imu_fill"}
+    assert sum('"imu_fill"' in l for l in lines) > 0
+    assert (tmp_path / "markers.csv").exists() and (tmp_path / "markers_camera.csv").exists()
+
+
+def test_postprocess_session_folder(sim_session, tmp_path):
+    """postprocess on a session folder that already has camera.jsonl (SVO step skipped)."""
+    import shutil
+    from dckft.run import main
+    _, paths = sim_session
+    sess = tmp_path / "capture_test"
+    sess.mkdir()
+    shutil.copy(paths["camera"], sess / "camera.jsonl")
+    shutil.copy(paths["camera"] + ".meta.json", sess / "camera.jsonl.meta.json")
+    shutil.copy(paths["imu"], sess / "imu.csv")
+    assert main(["postprocess", "--session", str(sess), "--no-render"]) == 0
+    assert (sess / "out" / "swing_00" / "swing.json").exists() or (sess / "out" / "swing.json").exists()
