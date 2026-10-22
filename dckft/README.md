@@ -2,15 +2,16 @@
 
 | Module | What it does |
 |---|---|
-| `run.py` | CLI: `process`, `live`, `simulate`, `validate`, `dump-config` |
+| `run.py` | CLI: `capture`, `postprocess`, `process`, `live`, `simulate`, `validate`, `dump-config` |
 | `config.py` | All tunables (bat geometry, IMU scaling, EKF noise, swing thresholds), JSON load/save |
 | `imu/frames.py` | 30-byte frame decode/encode, sync-word resync parser, tx-clock unwrap |
 | `imu/reader.py` | Serial/radio reader (Linux/Windows), ZMQ PUSH :5558, CSV, `--calibrate`, `--replay` |
 | `data.py` | Load camera JSONL / IMU CSV; device-clock → host-clock mapping; bat line from collinear markers |
 | `sync.py` | Cross-correlation time offset (bat-axis rate vs wrist rate) |
 | `calib.py` | Per-swing self-calibration: IMU orientation, grip vector, gyro bias, residual time offset |
-| `ekf.py` | Multiplicative quaternion EKF (gyro predict; camera-axis and gravity updates) |
-| `trajectory.py` | Knob track (accel-aided RTS smoother), flex correction, bat point velocities |
+| `ekf.py` | Multiplicative quaternion EKF (gyro predict; camera-axis and gravity updates) + RTS backward smoother |
+| `trajectory.py` | Flex correction, per-marker knob fixes, knob track (accel-aided Kalman/RTS), bat point velocities |
+| `markers.py` | Per-marker 400 Hz tracks; camera frames' missing markers filled from the fusion |
 | `swing.py` | Swing + impact detection (offline and live) |
 | `metrics.py` | Bat/hand speed, attack angle, vertical bat angle, time to contact, swing plane, ... |
 | `coaching.py` | Rule-based coaching notes; the LLM coach plugs in here later |
@@ -37,4 +38,7 @@
   residuals, EKF update counts, timings).
 - `fused.csv`: per-sample output at 400 Hz: time from onset, quaternion, knob, axis, tip, sweet
   spot, sweet-spot speed, and attitude uncertainty.
+- `markers.csv`: every marker at 400 Hz.
+- `markers_camera.csv` / `camera_filled.jsonl`: every marker at every camera frame, each tagged
+  `camera` (measured) or `imu_fill` (the camera missed it; position from the fusion).
 - `swing.png` (and `swing.mp4` with `--mp4`).

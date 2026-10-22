@@ -17,6 +17,10 @@ Updates:
                                                       H = [[R^T up]x , 0]
   * innovation gating (chi-square, 3 dof) rejects marker mis-detections.
 
+Backward pass (smooth=True, the default for recorded data): a Rauch-Tung-Striebel smoother
+re-runs the estimates from the end of the window to the start, so each sample also uses the
+camera fixes that came after it. See rts_smooth().
+
 Quaternions only -- no Euler angles anywhere (gimbal-lock constraint).
 """
 
@@ -45,10 +49,11 @@ class EkfResult:
     n_cam_rejected: int
     n_grav_updates: int
     cam_innov_deg: np.ndarray  # angles of accepted camera innovations
+    smoothed: bool = False     # True when the RTS backward pass was applied
 
 
 def run_ekf(t_imu, gyro, accel, t_cam, axis_cam, up, calib: Calibration, cfg: EkfConfig,
-            gyro_sat: float = 69.0) -> EkfResult:
+            gyro_sat: float = 69.0, smooth: bool = True) -> EkfResult:
     up = np.asarray(up, float) / np.linalg.norm(up)
     a = calib.grip_axis
     N = len(t_imu)
@@ -67,6 +72,9 @@ def run_ekf(t_imu, gyro, accel, t_cam, axis_cam, up, calib: Calibration, cfg: Ek
     I6 = np.eye(6)
 
     qs = np.empty((N, 4)); bs = np.empty((N, 3)); stds = np.empty(N); ow = np.empty((N, 3))
+    # history for the backward (RTS) pass
+    q_pred = np.empty((N, 4)); b_pred = np.empty((N, 3))
+    P_pred = np.empty((N, 6, 6)); P_filt = np.empty((N, 6, 6)); Fs = np.zeros((N, 6, 6))
     n_cam = n_rej = n_grav = 0
     innov = []
 
@@ -87,6 +95,8 @@ def run_ekf(t_imu, gyro, accel, t_cam, axis_cam, up, calib: Calibration, cfg: Ek
         return True
 
     for k in range(N):
+        if k == 0:
+            q_pred[0], b_pred[0], P_pred[0] = q, b, P
         if k > 0:
             dt = t_imu[k] - t_imu[k - 1]
             w = 0.5 * (gyro[k] + gyro[k - 1]) - b
@@ -98,6 +108,7 @@ def run_ekf(t_imu, gyro, accel, t_cam, axis_cam, up, calib: Calibration, cfg: Ek
             gn = cfg.gyro_noise * (20.0 if sat else 1.0)
             Qd = np.diag([gn ** 2 * dt] * 3 + [cfg.gyro_bias_walk ** 2 * dt] * 3)
             P = F @ P @ F.T + Qd
+            q_pred[k], b_pred[k], P_pred[k], Fs[k] = q, b, P, F
 
             # camera updates whose timestamps fall in (t[k-1], t[k]]
             while ci < len(tc) and tc[ci] <= t_imu[k]:
@@ -120,11 +131,45 @@ def run_ekf(t_imu, gyro, accel, t_cam, axis_cam, up, calib: Calibration, cfg: Ek
             if update(accel[k] / fn, h, H, R_grav):
                 n_grav += 1
 
-        qs[k] = q; bs[k] = b
-        stds[k] = np.degrees(np.sqrt(max(np.trace(P[:3, :3]), 0.0)))
-        ow[k] = Q.rotate(q, gyro[k] - b)
+        qs[k] = q; bs[k] = b; P_filt[k] = P
+
+    smoothed = False
+    if smooth and N > 1:
+        qs, bs, P_s = rts_smooth(qs, bs, P_filt, q_pred, b_pred, P_pred, Fs)
+        smoothed = True
+    else:
+        P_s = P_filt
+    for k in range(N):
+        stds[k] = np.degrees(np.sqrt(max(np.trace(P_s[k][:3, :3]), 0.0)))
+        ow[k] = Q.rotate(qs[k], gyro[k] - bs[k])
 
     axis = Q.rotate(qs, np.broadcast_to(a, (N, 3)))
     return EkfResult(t=np.asarray(t_imu), q=qs, bias=bs, omega_world=ow, axis=axis,
                      att_std_deg=stds, n_cam_updates=n_cam, n_cam_rejected=n_rej,
-                     n_grav_updates=n_grav, cam_innov_deg=np.array(innov))
+                     n_grav_updates=n_grav, cam_innov_deg=np.array(innov), smoothed=smoothed)
+
+
+def rts_smooth(q_f, b_f, P_f, q_p, b_p, P_p, F):
+    """
+    Rauch-Tung-Striebel backward pass for the error-state filter.
+
+    Recorded data is processed after the fact, so every estimate can use the measurements
+    that came AFTER it too. Going backwards from the last sample:
+        C_k   = P_k|k F_k+1^T P_k+1|k^-1
+        dx    = [ 2 vec(q_pred_k+1^-1 (x) q_smooth_k+1) ,  b_smooth_k+1 - b_pred_k+1 ]
+        x_k^s = x_k|k (+) C_k dx                 (quaternion: right-multiply by exp(dtheta))
+        P_k^s = P_k|k + C_k (P_k+1^s - P_k+1|k) C_k^T
+    Removes the lag/overshoot a forward-only filter shows right after each camera fix and
+    through camera gaps (blur, occlusion), where the forward filter can only coast on the gyro.
+    """
+    N = len(q_f)
+    q_s = q_f.copy(); b_s = b_f.copy(); P_s = P_f.copy()
+    for k in range(N - 2, -1, -1):
+        Pp = P_p[k + 1]
+        C = P_f[k] @ F[k + 1].T @ np.linalg.inv(Pp + 1e-15 * np.eye(6))
+        dth = Q.to_rotvec(Q.multiply(Q.conj(q_p[k + 1]), q_s[k + 1]))
+        dx = C @ np.concatenate([dth, b_s[k + 1] - b_p[k + 1]])
+        q_s[k] = Q.normalize(Q.multiply(q_f[k], Q.from_rotvec(dx[:3])))
+        b_s[k] = b_f[k] + dx[3:]
+        P_s[k] = P_f[k] + C @ (P_s[k + 1] - Pp) @ C.T
+    return q_s, b_s, P_s

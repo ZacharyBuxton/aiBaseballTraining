@@ -4,6 +4,10 @@ run.py -- the one entry point for the DC-KFT pipeline.
   # Offline: process a recorded session (camera JSONL from track_bat.py + IMU CSV from the reader)
   python -m dckft.run process --cam sessions/s1/camera.jsonl --imu sessions/s1/imu.csv --out sessions/s1/out
 
+  # Recommended for accuracy: record everything now, process every swing afterwards
+  python -m dckft.run capture --port /dev/ttyUSB0          # Ctrl+C when done
+  python -m dckft.run postprocess --session sessions/capture_20261105_141500
+
   # Live on the Jetson (start track_bat.py and dckft.imu.reader first; see docs/RUNBOOK.md)
   python -m dckft.run live --session-dir sessions
 
@@ -126,6 +130,102 @@ class _Recorder:
         self.cam.close(); self.imu.close()
 
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def cmd_capture(a, cfg: FusionConfig) -> int:
+    """
+    Capture accurate data, process after the fact.
+
+    Phase 1 (during the session): the ZED records every frame to an SVO with NO marker
+    detection (track_bat.py --record-only), and the IMU reader logs every sample to CSV. Nothing
+    competes for the 8.3 ms frame budget, so no frames are dropped to processing.
+    Phase 2 (after Ctrl+C or --seconds): every recorded frame is run through marker detection
+    (track_bat.py --svo, which never skips frames), then every swing goes through the fusion
+    pipeline with the Kalman smoother and the per-marker gap filling.
+    """
+    import signal
+    import subprocess
+
+    session = os.path.abspath(os.path.join(a.session_dir, time.strftime("capture_%Y%m%d_%H%M%S")))
+    os.makedirs(session, exist_ok=True)
+    svo = os.path.join(session, "camera.svo2")
+    imu_csv = os.path.join(session, "imu.csv")
+    py = sys.executable
+    cam_cmd = [py, os.path.join(REPO_ROOT, "Cameras", "track_bat.py"), "--record", svo,
+               "--record-only", "--codec", a.codec, "--quiet"]
+    if a.cam_config:
+        cam_cmd += ["--config", a.cam_config]
+    imu_cmd = [py, "-m", "dckft.imu.reader", "--csv", imu_csv, "--no-zmq", "--quiet"]
+    if a.port:
+        imu_cmd += ["--port", a.port]
+    if a.config:
+        imu_cmd += ["--config", a.config]
+
+    print(f"Capture session: {session}")
+    # own sessions so a terminal Ctrl+C reaches only us; we forward exactly one SIGINT each
+    procs = []
+    if not a.no_camera:
+        procs.append(("camera", subprocess.Popen(cam_cmd, cwd=REPO_ROOT, start_new_session=True)))
+    procs.append(("imu", subprocess.Popen(imu_cmd, cwd=REPO_ROOT, start_new_session=True)))
+    t0 = time.time()
+    print("Recording camera + IMU. Hold still ~1 s in the stance before each swing. "
+          "Ctrl+C to stop." + (f" (auto-stop after {a.seconds:.0f} s)" if a.seconds else ""))
+    try:
+        while True:
+            time.sleep(0.5)
+            dead = [n for n, p in procs if p.poll() is not None]
+            if dead:
+                print(f"\n[capture] {', '.join(dead)} process exited early -- stopping.")
+                break
+            if a.seconds and time.time() - t0 >= a.seconds:
+                break
+    except KeyboardInterrupt:
+        pass
+    for _, p in procs:
+        if p.poll() is None:
+            p.send_signal(signal.SIGINT)
+    for n, p in procs:
+        try:
+            p.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            print(f"[capture] {n} did not stop; terminating")
+            p.terminate()
+    print(f"Stopped after {time.time() - t0:.1f} s.")
+    if a.no_process:
+        print(f"Process later with: python -m dckft.run postprocess --session {session}")
+        return 0
+    a.session = session
+    return cmd_postprocess(a, cfg)
+
+
+def cmd_postprocess(a, cfg: FusionConfig) -> int:
+    """Phase 2 of capture: detect markers in every recorded frame, then fuse every swing."""
+    import subprocess
+    session = os.path.abspath(a.session)
+    svo = os.path.join(session, "camera.svo2")
+    cam_jsonl = os.path.join(session, "camera.jsonl")
+    imu_csv = os.path.join(session, "imu.csv")
+    if not os.path.exists(cam_jsonl) or getattr(a, "redetect", False):
+        if not os.path.exists(svo):
+            print(f"No camera.jsonl or camera.svo2 in {session}")
+            return 1
+        if os.path.exists(cam_jsonl):
+            os.remove(cam_jsonl)            # track_bat appends; start clean
+        cmd = [sys.executable, os.path.join(REPO_ROOT, "Cameras", "track_bat.py"), "--svo", svo,
+               "--jsonl", cam_jsonl, "--no-zmq", "--quiet"]
+        if getattr(a, "cam_config", None):
+            cmd += ["--config", a.cam_config]
+        print("Detecting markers in every recorded frame ...")
+        rc = subprocess.call(cmd, cwd=REPO_ROOT)
+        if rc != 0 or not os.path.exists(cam_jsonl):
+            print("[postprocess] marker detection on the SVO failed")
+            return 1
+    a.cam, a.imu, a.all, a.swing = cam_jsonl, imu_csv, True, -1
+    a.out = os.path.join(session, "out")
+    return cmd_process(a, cfg)
+
+
 def cmd_live(a, cfg: FusionConfig) -> int:
     import zmq
     ctx = zmq.Context.instance()
@@ -245,7 +345,21 @@ def main(argv=None) -> int:
     lv.add_argument("--camera-zmq", help="default tcp://127.0.0.1:5557")
     lv.add_argument("--imu-zmq", help="default tcp://127.0.0.1:5558")
 
-    for q in (p, s, lv):
+    cp = sub.add_parser("capture", help="record camera + IMU now, process every swing afterwards")
+    cp.add_argument("--session-dir", default="sessions")
+    cp.add_argument("--port", help="IMU radio serial port (default: auto)")
+    cp.add_argument("--codec", default="h265", help="SVO codec; use lossless-cpu on an Orin Nano")
+    cp.add_argument("--cam-config", help="Cameras/ JSON config (marker hues, exposure)")
+    cp.add_argument("--seconds", type=float, default=0.0, help="auto-stop after N seconds")
+    cp.add_argument("--no-process", action="store_true", help="only record; run postprocess later")
+    cp.add_argument("--no-camera", action="store_true", help=argparse.SUPPRESS)
+
+    pp = sub.add_parser("postprocess", help="process a capture session folder")
+    pp.add_argument("--session", required=True, help="sessions/capture_YYYYmmdd_HHMMSS")
+    pp.add_argument("--cam-config", help="Cameras/ JSON config used for marker detection")
+    pp.add_argument("--redetect", action="store_true", help="re-run marker detection on the SVO")
+
+    for q in (p, s, lv, cp, pp):
         q.add_argument("--no-show", action="store_true", help="don't open a window (still saves PNG)")
         q.add_argument("--no-render", action="store_true", help="skip rendering entirely")
         q.add_argument("--mp4", action="store_true", help="also save swing.mp4 (needs ffmpeg)")
@@ -263,7 +377,8 @@ def main(argv=None) -> int:
         return 0
     try:
         return {"process": cmd_process, "simulate": cmd_simulate, "validate": cmd_validate,
-                "live": cmd_live}[a.cmd](a, cfg)
+                "live": cmd_live, "capture": cmd_capture,
+                "postprocess": cmd_postprocess}[a.cmd](a, cfg)
     except NoSwingError as e:
         print(f"[dckft] {e}")
         return 1

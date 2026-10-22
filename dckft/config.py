@@ -47,6 +47,11 @@ class ImuConfig:
     hg_lsb: float = 0.4788403320        # m/s^2 per LSB (ADXL375, +-200 g)
     gyro_saturation_rads: float = 69.0
     accel_saturation_ms2: float = 300.0
+    hg_saturation_ms2: float = 1900.0   # ADXL375 +-200 g
+    # Swap in the ADXL375 where the ICM45686 accelerometer clips. Assumes the legacy axis mapping
+    # puts both sensors in the same frame -- check once on the bench (dckft.imu.reader --csv, tilt
+    # the board, compare accel_* with accel_*2) before relying on it.
+    use_highg_when_saturated: bool = True
 
 
 @dataclass
@@ -70,6 +75,7 @@ class EkfConfig:
     gravity_gate_rads: float = 1.5      # ... and |omega| below this
     calib_window_s: float = 0.6         # data used for the self-calibration before swing onset
     init_bias_from_stance: bool = True
+    smooth: bool = True                 # RTS backward pass (recorded data is processed after the fact)
 
 
 @dataclass

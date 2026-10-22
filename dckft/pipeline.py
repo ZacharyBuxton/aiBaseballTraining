@@ -22,6 +22,7 @@ from .coaching import RuleBasedCoach
 from .config import FusionConfig, G
 from .data import CameraData, ImuData, bat_line_from_markers
 from .ekf import EkfResult, run_ekf
+from .markers import MarkerFill, fill_markers, write_outputs as write_marker_outputs
 from .metrics import SwingMetrics, compute_metrics
 from .swing import Swing, detect_swings
 from .sync import axis_rate, estimate_offset
@@ -30,6 +31,23 @@ from .trajectory import Trajectory, build_trajectory
 
 class NoSwingError(RuntimeError):
     pass
+
+
+def merge_accels(accel, accel_hg, cfg: FusionConfig):
+    """
+    The ICM45686 accelerometer clips at +-32 g, and the wrist exceeds that late in the swing --
+    exactly where the camera tends to lose the markers. The board's ADXL375 reads to +-200 g, so
+    where the ICM is saturated its samples are swapped in (noisier, but not clipped).
+    Returns (accel, valid): valid is False only where neither sensor is usable.
+    """
+    sat = np.any(np.abs(accel) >= 0.95 * cfg.imu.accel_saturation_ms2, axis=1)
+    out = accel.copy()
+    valid = ~sat
+    if cfg.imu.use_highg_when_saturated and accel_hg is not None and np.any(accel_hg):
+        hg_ok = sat & np.all(np.abs(accel_hg) < 0.95 * cfg.imu.hg_saturation_ms2, axis=1)
+        out[hg_ok] = accel_hg[hg_ok]
+        valid = valid | hg_ok
+    return out, valid
 
 
 @dataclass
@@ -48,6 +66,7 @@ class SwingResult:
     cam_t: Optional[np.ndarray] = None
     cam_knob: Optional[np.ndarray] = None
     cam_axis: Optional[np.ndarray] = None
+    markers: Optional[MarkerFill] = None
 
     def diagnostics(self) -> dict:
         e = self.ekf
@@ -65,6 +84,9 @@ class SwingResult:
             "ekf_gravity_updates": e.n_grav_updates,
             "ekf_median_innovation_deg": (round(float(np.median(e.cam_innov_deg)), 2)
                                           if len(e.cam_innov_deg) else None),
+            "ekf_smoothed": bool(e.smoothed),
+            "markers": (self.markers.summary((self.swing.t_onset, self.swing.t_end))
+                        if self.markers is not None else None),
             "timings_ms": {k: round(v, 1) for k, v in self.timings_ms.items()},
         }
 
@@ -89,6 +111,8 @@ class SwingResult:
                             *np.round(tr.knob[k], 5), *np.round(tr.axis[k], 5),
                             *np.round(tip[k], 5), *np.round(ss[k], 5), round(float(spd[k]), 4),
                             round(float(self.ekf.att_std_deg[k]), 3)])
+        if self.markers is not None:
+            write_marker_outputs(self.markers, out_dir, self.swing.t_onset)
         return summary
 
 
@@ -153,34 +177,38 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
     tm["calibration"] = (time.perf_counter() - t1) * 1e3
     t1 = time.perf_counter()
     ekf = run_ekf(win_imu.t, win_imu.gyro, win_imu.accel, t_cam, axis_w, up, cal, cfg.ekf,
-                  cfg.imu.gyro_saturation_rads)
+                  cfg.imu.gyro_saturation_rads, smooth=cfg.ekf.smooth)
     tm["ekf"] = (time.perf_counter() - t1) * 1e3
 
     # ---- trajectory, metrics, coaching
     t1 = time.perf_counter()
     acc_world = acc_valid = None
     if cfg.knob_track == "kalman":
-        acc_world = Q.rotate(ekf.q, win_imu.accel) + np.asarray(g, float)
+        acc_body, acc_valid = merge_accels(win_imu.accel, win_imu.accel_hg, cfg)
+        acc_world = Q.rotate(ekf.q, acc_body) + np.asarray(g, float)
         # lever arm: the IMU sits imu_s_m up the handle from the knob, so remove the
         # tangential + centripetal terms to get the knob's acceleration
         r_arm = cfg.bat.imu_s_m * ekf.axis
         w = ekf.omega_world
         alpha = np.gradient(w, ekf.t, axis=0)
         acc_world = acc_world - np.cross(alpha, r_arm) - np.cross(w, np.cross(w, r_arm))
-        acc_valid = np.all(np.abs(win_imu.accel) < 0.95 * cfg.imu.accel_saturation_ms2, axis=1)
         if sw.t_contact is not None:      # impact ringing: don't integrate it
             acc_valid &= ~((win_imu.t >= sw.t_contact - 0.005) & (win_imu.t <= sw.t_contact + 0.05))
     traj = build_trajectory(ekf.t, ekf.axis, ekf.omega_world, t_cam, knob_w,
                             lam=cfg.knob_spline_lam, acc_world=acc_world, axis_cam=axis_w,
-                            flex_lam=cfg.flex_lam, acc_valid=acc_valid)
+                            flex_lam=cfg.flex_lam, acc_valid=acc_valid,
+                            marker_pts={m: p[cm] for m, p in cam.points.items()},
+                            marker_s=cfg.bat.marker_s_m)
     metrics = compute_metrics(traj, ekf.omega_world, sw, cfg.bat, up)
     notes = (coach or RuleBasedCoach()).notes(metrics)
     tm["metrics"] = (time.perf_counter() - t1) * 1e3
+    marker_fill = fill_markers(traj, cfg.bat, cam.t[cm], {m: p[cm] for m, p in cam.points.items()})
     tm["total"] = (time.perf_counter() - t_start) * 1e3
 
     res = SwingResult(swing=sw, metrics=metrics, notes=notes, traj=traj, ekf=ekf, calib=cal, up=up,
                       time_offset_s=offset, sync_corr=corr, camera_coverage=coverage,
-                      timings_ms=tm, cam_t=t_cam, cam_knob=knob_w, cam_axis=axis_w)
+                      timings_ms=tm, cam_t=t_cam, cam_knob=knob_w, cam_axis=axis_w,
+                      markers=marker_fill)
     if verbose:
         print(json.dumps(res.diagnostics(), indent=2))
     return res

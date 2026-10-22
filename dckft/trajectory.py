@@ -59,7 +59,7 @@ def smooth_positions(t_cam, xyz, t_out, lam=None):
 
 
 def kalman_knob(t_imu, acc_world, t_cam, knob_cam, meas_std_m=0.006, acc_std=25.0,
-                p0_std=0.05, acc_valid=None, invalid_acc_std=400.0):
+                p0_std=0.05, acc_valid=None, invalid_acc_std=400.0, meas_n=None):
     """
     Accel-aided knob track: constant-velocity model driven by the wrist IMU's world-frame
     linear acceleration (R(q) f + g), corrected by the camera knob at 120 Hz, then an RTS
@@ -77,10 +77,12 @@ def kalman_knob(t_imu, acc_world, t_cam, knob_cam, meas_std_m=0.006, acc_std=25.
         raise ValueError("Not enough knob fixes for the trajectory")
     # measurement index per IMU step: nearest IMU sample at/after each camera time
     meas = {}
+    nn = np.ones(len(t_cam)) if meas_n is None else np.asarray(meas_n, float)
+    nn = nn[ok]
     for i, ti in enumerate(tc):
         k = int(np.searchsorted(t_imu, ti))
         if 0 <= k < N:
-            meas[k] = zc[i]
+            meas[k] = (zc[i], max(nn[i], 1.0))
     x = np.zeros((N, 6)); Pp = np.zeros((N, 6, 6))
     xf = np.zeros((N, 6)); Pf = np.zeros((N, 6, 6)); Fs = np.zeros((N, 6, 6))
     xk = np.concatenate([zc[0], np.zeros(3)])
@@ -100,8 +102,9 @@ def kalman_knob(t_imu, acc_world, t_cam, knob_cam, meas_std_m=0.006, acc_std=25.
             Fs[k] = F
         x[k], Pp[k] = xk, Pk
         if k in meas:
-            y = meas[k] - H @ xk
-            S = H @ Pk @ H.T + Rm
+            z, n_obs = meas[k]
+            y = z - H @ xk
+            S = H @ Pk @ H.T + Rm / n_obs
             K = Pk @ H.T @ np.linalg.inv(S)
             if y @ np.linalg.solve(S, y) < 50.0:
                 xk = xk + K @ y
@@ -156,17 +159,49 @@ def flex_correction(t_imu, u_imu, t_cam, axis_cam, lam=2e-6, max_gap_s=0.02):
     return u_corr, dd
 
 
+def knob_from_markers(t_cam, marker_pts, marker_s, t_imu, u_imu):
+    """
+    Knob fix from EVERY marker the camera saw, using the fused bat axis:  k = p_i - s_i u(t).
+    A single visible marker still yields a knob fix, and fixes from far-out markers no longer
+    swing with a noisy camera-only axis. Returns (knob (M,3), n_markers (M,)).
+    """
+    u_c = np.column_stack([np.interp(t_cam, t_imu, u_imu[:, j]) for j in range(3)])
+    u_c /= np.linalg.norm(u_c, axis=1, keepdims=True)
+    acc = np.zeros((len(t_cam), 3))
+    n = np.zeros(len(t_cam))
+    for mid, s in marker_s.items():
+        p = marker_pts.get(mid)
+        if p is None:
+            continue
+        seen = np.isfinite(p).all(axis=1)
+        acc[seen] += p[seen] - s * u_c[seen]
+        n[seen] += 1
+    knob = np.full((len(t_cam), 3), np.nan)
+    has = n > 0
+    knob[has] = acc[has] / n[has, None]
+    inside = (t_cam >= t_imu[0]) & (t_cam <= t_imu[-1])
+    knob[~inside] = np.nan
+    return knob, n
+
+
 def build_trajectory(t_imu, axis, omega_world, t_cam, knob_cam, lam=None,
-                     acc_world=None, axis_cam=None, flex_lam=2e-6, acc_valid=None) -> Trajectory:
-    if acc_world is not None:
-        knob, knob_vel = kalman_knob(t_imu, acc_world, t_cam, knob_cam, acc_valid=acc_valid)
-    else:
-        knob, knob_vel = smooth_positions(t_cam, knob_cam, t_imu, lam)
+                     acc_world=None, axis_cam=None, flex_lam=2e-6, acc_valid=None,
+                     marker_pts=None, marker_s=None) -> Trajectory:
+    # 1) bat axis: fused (smoothed) IMU orientation + camera flex correction
     u = axis / np.linalg.norm(axis, axis=1, keepdims=True)
     omega = np.asarray(omega_world, float)
     if axis_cam is not None and flex_lam:
         u, extra = flex_correction(t_imu, u, t_cam, axis_cam, flex_lam)
         u = u / np.linalg.norm(u, axis=1, keepdims=True)
         omega = omega + extra
+    # 2) knob: per-marker fixes along that axis (if marker data given), then accel-aided smoother
+    meas_n = None
+    if marker_pts is not None and marker_s:
+        knob_cam, meas_n = knob_from_markers(t_cam, marker_pts, marker_s, t_imu, u)
+    if acc_world is not None:
+        knob, knob_vel = kalman_knob(t_imu, acc_world, t_cam, knob_cam, acc_valid=acc_valid,
+                                     meas_n=meas_n)
+    else:
+        knob, knob_vel = smooth_positions(t_cam, knob_cam, t_imu, lam)
     du = np.cross(omega, u)
     return Trajectory(t=np.asarray(t_imu), knob=knob, knob_vel=knob_vel, axis=u, axis_rate=du)
