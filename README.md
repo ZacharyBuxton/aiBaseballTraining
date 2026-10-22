@@ -30,15 +30,21 @@ Wrist IMU (ICM45686 + ADXL375) ─900 MHz─> USB ──>      │      → traj
 4. **Self-calibration.** Each swing solves for the IMU's orientation in the world and the "grip
    vector" (the bat axis as seen from the wrist). It uses the stance gravity and the camera bat axis.
    No calibration procedure is needed.
-5. **Quaternion MEKF.**
+5. **Quaternion MEKF + RTS smoother.**
    - The gyro drives the prediction.
    - The camera bat axis corrects heading and pitch, replacing a magnetometer. The ICM45686 has
      none, so fence magnetic interference is a non-issue.
    - Gravity corrects tilt while the hitter is still.
    - Gyro bias is estimated.
+   - Recorded data is processed after the fact, so a backward (Rauch–Tung–Striebel) pass lets each
+     sample also use the camera fixes that came after it.
    - Quaternions only, no Euler angles.
-6. **Trajectory.**
-   - The knob position comes from a camera fix plus a wrist-accelerometer RTS smoother.
+6. **Trajectory and per-marker gap filling.**
+   - Every marker the camera sees gives its own knob fix along the fused bat axis, so one visible
+     marker is enough. The knob track is an accelerometer-driven Kalman/RTS smoother over those fixes; where the ICM45686
+     clips at ±32 g, the ADXL375 (±200 g) is used instead.
+   - Each marker's full track is rebuilt at 400 Hz; frames the camera missed are filled from the
+     IMU-driven fusion (`markers_camera.csv`, `camera_filled.jsonl`, flagged `camera` / `imu_fill`).
    - A complementary correction removes wrist-to-bat flex.
    - The IMU bridges blur and occlusion gaps near contact.
 7. **Metrics and coaching.** Bat speed, hand speed, attack angle, vertical bat angle, time to
@@ -49,11 +55,12 @@ Wrist IMU (ICM45686 + ADXL375) ─900 MHz─> USB ──>      │      → traj
 
 | Metric | Mean abs. error | 95th pct |
 |---|---|---|
-| Bat speed at contact | **1.9 %** | 3.8 % |
-| Peak hand speed | 4.1 % | 7.6 % |
-| Attack angle | 1.2° | 2.8° |
-| Vertical bat angle | 0.9° | 1.8° |
-| Processing time (per swing) | 0.36 s mean, 0.47 s max | |
+| Bat speed at contact | **1.9 %** | 4.5 % |
+| Peak hand speed | 2.9 % | 6.8 % |
+| Attack angle | 1.2° | 2.5° |
+| Vertical bat angle | 0.8° | 1.6° |
+| IMU-filled marker position (frames the camera missed) | 10 mm median | 25 mm |
+| Processing time (per swing) | 0.48 s mean, 0.61 s max | |
 
 **Simulation conditions.** Every swing in the run includes:
 - camera noise
@@ -79,8 +86,14 @@ python -m dckft.run simulate --out sessions/sim
 python -m pytest -q tests
 ```
 
-On the rig, follow **[docs/RUNBOOK.md](docs/RUNBOOK.md)**: start the camera tracker, the IMU reader, then
-`python -m dckft.run live`.
+On the rig, follow **[docs/RUNBOOK.md](docs/RUNBOOK.md)**. For accurate data, record first and process after:
+
+```bash
+python -m dckft.run capture --port /dev/ttyUSB0      # records camera (no detection) + IMU; Ctrl+C to stop
+                                                     # then detects markers in every frame and fuses every swing
+```
+
+`python -m dckft.run live` gives instant feedback instead, at the risk of dropped frames.
 
 ## Repository layout
 
