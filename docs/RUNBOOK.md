@@ -27,7 +27,23 @@ The IMU check passes when:
 - `resyncs` stays near 0
 - the CSV shows |accel| ≈ 9.8 while the IMU sits still
 
-## 2. Start the three processes (three terminals)
+## 2a. Recommended: record now, process after (most accurate)
+
+```bash
+python -m dckft.run capture --port /dev/ttyUSB0 --cam-config Cameras/cage.json   # Orin Nano: add --codec lossless-cpu
+```
+
+- While it runs, the camera records every frame with no marker detection, and the IMU logs every sample.
+- Press Ctrl+C when done (or pass `--seconds 60`).
+- It then detects markers in every recorded frame and fuses every swing into
+  `sessions/capture_*/out/swing_NN/`.
+- To re-run the processing later (e.g. after re-tuning hues):
+
+```bash
+python -m dckft.run postprocess --session sessions/capture_YYYYmmdd_HHMMSS --redetect
+```
+
+## 2b. Live feedback: three processes (three terminals)
 
 ```bash
 # T1: camera tracker (publishes on :5557)

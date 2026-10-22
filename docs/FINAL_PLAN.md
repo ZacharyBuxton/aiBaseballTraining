@@ -26,6 +26,9 @@
 | 10 | Simulator + validation (<5 % speed error, <5 s latency) | ✅ passing on simulated swings |
 | 11 | Coaching: rule-based (LLM later) | ✅ rule-based done |
 | 12 | Docs: README, runbook, this plan | ✅ done |
+| 13 | Per-marker gap filling from the IMU (`markers.py`, outputs tagged camera / imu_fill) | ✅ done (Oct 22) |
+| 14 | Record-then-process: `dckft.run capture` / `postprocess`, `track_bat.py --record-only` | ✅ done, needs a Jetson run |
+| 15 | Kalman RTS backward smoother; per-marker knob fixes; ADXL375 when the ICM clips | ✅ done (Oct 22) |
 
 ## Remaining work, all on the real rig (in order)
 
@@ -37,11 +40,15 @@
 3. **Tilt test the ZED gravity.**
    - Check that the `gravity` in `track_bat`'s `.meta.json` points down (+y for a level camera).
    - If not, set `gravity_cam` in the config.
-4. **First real swings.** Record 10 swings with `track_bat.py --record` and `--jsonl`, plus `imu.reader --csv`. Then run
-   `dckft.run process --all` and check the diagnostics:
+4. **First real swings.** Record 10 swings with `python -m dckft.run capture`, then check the diagnostics in each
+   `swing.json`:
    - `calib_rms_axis_deg` should be under about 5°
    - `ekf_camera_rejected` should be about 0
    - `sync_correlation` should be above 0.5
+   - `markers`: `seen_pct`, `longest_gap_ms`, `residual_rms_mm` per marker (residual under ~15 mm)
+   - first, check the ADXL375 axes match the ICM45686 (tilt the board, compare `accel_*` with `accel_*2`);
+     if not, set `imu.use_highg_when_saturated` to false until fixed
+   - check that SVO replay keeps the original capture timestamps (the IMU sync relies on it)
 5. **Tune the thresholds** on real data:
    - `swing.trigger_rads` and `swing.contact_hg_ms2` (impact spike on the ADXL375)
    - `ekf.grip_flex_rad`
