@@ -26,6 +26,12 @@ writes <svo>.meta.json with the camera info, calibration and the ZED IMU gravity
 that SVO is processed later, the gravity estimate is carried into the JSONL's .meta.json.
 `python -m dckft.run capture` runs this together with the IMU reader for you.
 
+Markers: by default every band is NEON PINK (markers.layout = "bands", n_bands = 3); the bands
+are named pink_1 (nearest the knob) .. pink_3 by their order along the bat (band_labeler.py).
+markers.layout = "stripe" tracks one long pink stripe (stripe_start / stripe_end);
+"colors" is the old one-color-per-marker scheme. Pass --bat-config dckft_config.json to share
+the measured band distances, which makes the labels more robust.
+
 Other examples:
     python Cameras/track_bat.py --preview                    # live, publish on :5557
     python Cameras/track_bat.py --preview --exposure-us 800 --save-config cage.json
@@ -49,8 +55,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import load_config, save_config                                # noqa: E402
 from marker_detector import ColorMarkerDetector, draw_detections            # noqa: E402
 from payload import FramePublisher, JsonlWriter, build_frame_payload        # noqa: E402
-from stereo import match_and_triangulate, print_depth_budget, sample_xyz    # noqa: E402
+from stereo import print_depth_budget                                       # noqa: E402
 from zed_camera import CameraError, ZedCamera                               # noqa: E402
+from band_labeler import BandLabeler, band_labels                           # noqa: E402
+from frame_points import detect_points, gravity_in_camera                   # noqa: E402
 
 
 def parse_args():
@@ -59,6 +67,7 @@ def parse_args():
     p.add_argument("--save-config", help="Write the effective config to this path and continue")
     p.add_argument("--svo", help="Process a recorded .svo2 instead of the live camera")
     p.add_argument("--record", help="Record the live session to this .svo2 path")
+    p.add_argument("--bat-config", help="dckft config JSON: reuse its bat.marker_s_m as band distances")
     p.add_argument("--record-only", action="store_true",
                    help="With --record: only record (no detection/publishing); fastest capture")
     p.add_argument("--codec", default="h265", choices=sorted(ZedCamera.RECORD_CODECS),
@@ -93,6 +102,12 @@ def apply_overrides(cfg, args):
         cfg.output.jsonl_path = args.jsonl
     if args.camera_id:
         cfg.output.camera_id = args.camera_id
+    if getattr(args, "bat_config", None) and cfg.markers.layout != "colors":
+        with open(args.bat_config) as f:
+            s_m = json.load(f).get("bat", {}).get("marker_s_m", {})
+        want = band_labels(cfg.markers.layout, cfg.markers.n_bands)
+        if all(k in s_m for k in want):
+            cfg.markers.band_s_m = [float(s_m[k]) for k in want]
     return cfg
 
 
@@ -155,7 +170,9 @@ def main() -> int:
 
     publisher = jsonl = None
     n_frames = n_published = 0
-    hits = {m: 0 for m in cfg.markers.hues}
+    labels = (list(cfg.markers.hues) if cfg.markers.layout == "colors"
+              else band_labels(cfg.markers.layout, cfg.markers.n_bands))
+    hits = {m: 0 for m in labels}
     try:
         info = cam.info()
         calib = cam.calibration()
@@ -194,6 +211,12 @@ def main() -> int:
 
         det_left = ColorMarkerDetector(cfg.markers)
         det_right = ColorMarkerDetector(cfg.markers)
+        labeler = None
+        if cfg.markers.layout != "colors":
+            labeler = BandLabeler(labels, cfg.markers.band_s_m, gravity_in_camera(gravity),
+                                  cfg.markers.label_gate_m)
+            print(f"Markers: {cfg.markers.layout} of {cfg.markers.color_id} -> {', '.join(labels)}"
+                  + ("" if cfg.markers.band_s_m else "  (no band_s_m: labels from tracking + gravity)"))
         period_s = 1.0 / max(1.0, info["fps"])
         proc_ms = deque(maxlen=240)
         ts_hist = deque(maxlen=240)
@@ -210,25 +233,8 @@ def main() -> int:
             n_frames += 1
             ts_hist.append(frame.ts_ns)
 
-            left_dets = det_left.detect(frame.left)
-            right_dets = det_right.detect(frame.right)
-
-            points = {}
-            if args.depth_source == "stereo":
-                matched = match_and_triangulate(left_dets, right_dets, calib,
-                                                cfg.markers.max_row_mismatch_px,
-                                                cfg.camera.depth_min_m, cfg.camera.depth_max_m)
-                for m, sp in matched.items():
-                    points[m] = {"xyz": sp.xyz,
-                                 "disparity_px": round(sp.disparity_px, 3),
-                                 "row_err_px": round(sp.row_mismatch_px, 3),
-                                 "uv_left": [round(sp.uv_left[0], 2), round(sp.uv_left[1], 2)],
-                                 "uv_right": [round(sp.uv_right[0], 2), round(sp.uv_right[1], 2)]}
-            else:
-                for m, d in left_dets.items():
-                    xyz = sample_xyz(frame.xyz, d.u, d.v)
-                    if xyz is not None and cfg.camera.depth_min_m <= xyz[2] <= cfg.camera.depth_max_m:
-                        points[m] = {"xyz": xyz, "uv_left": [round(d.u, 2), round(d.v, 2)]}
+            left_dets, right_dets, points = detect_points(
+                frame, cfg, calib, det_left, det_right, labeler, args.depth_source)
 
             for m in points:
                 hits[m] += 1

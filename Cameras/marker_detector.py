@@ -162,6 +162,65 @@ class ColorMarkerDetector:
 
         return results
 
+    # ------------------------------------------------- same-color bands / stripe
+    def detect_blobs(self, bgr: np.ndarray, color_id: str, max_blobs: int) -> List[Detection]:
+        """
+        All pink bands in one image: the max_blobs largest blobs of color_id, each re-measured at
+        full resolution. Same-color blobs can't be told apart here, so every Detection carries
+        marker_id=color_id; band_labeler.py names them after triangulation (order along the bat).
+        A full-frame coarse search every frame -- no per-band prediction window to mix up.
+        """
+        cfg = self.cfg
+        H, W = bgr.shape[:2]
+        s = cfg.detection_scale
+        small = bgr if s == 1.0 else cv.resize(bgr, (int(W * s), int(H * s)), interpolation=cv.INTER_AREA)
+        hsv_small = cv.cvtColor(small, cv.COLOR_BGR2HSV)
+        mask = self._mask(hsv_small, color_id)
+        mask = cv.morphologyEx(mask, cv.MORPH_OPEN, self.kernel)
+        mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, self.kernel)
+        blobs = sorted(self._blobs(mask, max(1.0, cfg.min_area_px * s * s)),
+                       key=lambda b: -b[2])[:max_blobs]
+        out: List[Detection] = []
+        for cx, cy, area, (bx, by, bw, bh) in blobs:
+            bbox_full = (int(bx / s), int(by / s), int(np.ceil(bw / s)), int(np.ceil(bh / s)))
+            refined = self._refine(bgr, color_id, bbox_full)
+            u, v, a = refined if refined is not None else (cx / s, cy / s, area / (s * s))
+            if a >= cfg.min_area_px:
+                out.append(Detection(color_id, u, v, a, bbox_full))
+        return out
+
+    def detect_stripe_ends(self, bgr: np.ndarray, color_id: str) -> List[Detection]:
+        """
+        Both ends of one long pink stripe: the largest blob's pixels are projected onto their
+        principal axis and the 2nd / 98th percentiles taken as the ends (robust to ragged tape
+        edges). Returns [] or two Detections (unordered; band_labeler.py decides which end is
+        the knob side).
+        """
+        dets = self.detect_blobs(bgr, color_id, 1)
+        if not dets:
+            return []
+        x, y, w, h = dets[0].bbox
+        p = self.cfg.refine_pad_px
+        H, W = bgr.shape[:2]
+        x0, y0, x1, y1 = max(0, x - p), max(0, y - p), min(W, x + w + p), min(H, y + h + p)
+        hsv = cv.cvtColor(bgr[y0:y1, x0:x1], cv.COLOR_BGR2HSV)
+        ys, xs = np.nonzero(self._mask(hsv, color_id))
+        if len(xs) < self.cfg.min_area_px:
+            return []
+        pts = np.column_stack([xs + x0, ys + y0]).astype(float)
+        c = pts.mean(0)
+        _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+        proj = (pts - c) @ vt[0]
+        lo, hi = np.percentile(proj, [2, 98])
+        if hi - lo < 4.0:                    # not elongated: can't define two ends
+            return []
+        ends = []
+        for t in (lo, hi):
+            near = np.abs(proj - t) <= max(1.5, 0.03 * (hi - lo))
+            u, v = pts[near].mean(0)          # average across the stripe's width at that end
+            ends.append(Detection(color_id, float(u), float(v), float(near.sum()), dets[0].bbox))
+        return ends
+
     def _lost(self, marker_id: str) -> None:
         self.last_pos[marker_id] = None
         self.last_vel[marker_id] = (0.0, 0.0)

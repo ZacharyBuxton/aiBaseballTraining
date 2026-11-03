@@ -25,7 +25,7 @@ sub-pixel precision in marker_detector.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -93,6 +93,55 @@ def match_and_triangulate(left: Dict[str, Detection], right: Dict[str, Detection
             continue
         out[marker_id] = StereoPoint(marker_id, xyz, dl.u - dr.u, row_err,
                                      (dl.u, dl.v), (dr.u, dr.v))
+    return out
+
+
+def match_unlabeled(left: List[Detection], right: List[Detection], calib: StereoCalib,
+                    max_row_mismatch_px: float, z_min_m: float, z_max_m: float) -> List[StereoPoint]:
+    """
+    Pair same-color detections between the rectified images. A point sits on the same row in
+    both images and has positive disparity, so every left/right pair is scored by its row
+    mismatch and the best one-to-one pairing is kept (all pairings tried; only a handful of
+    bands). Ties along one row (a level bat) are broken by keeping left-to-right order.
+    """
+    from itertools import permutations
+    nl, nr = len(left), len(right)
+    if nl == 0 or nr == 0:
+        return []
+
+    def pair_ok(dl, dr):
+        if abs(dl.v - dr.v) > max_row_mismatch_px:
+            return None
+        xyz = triangulate(dl.u, 0.5 * (dl.v + dr.v), dr.u, calib)
+        if xyz is None or not (z_min_m <= xyz[2] <= z_max_m):
+            return None
+        return xyz
+
+    best, best_cost = [], None
+    k = min(nl, nr)
+    for li in permutations(range(nl), k):
+        for ri in permutations(range(nr), k):
+            pairs, cost, order_pen = [], 0.0, 0.0
+            for a, b in zip(li, ri):
+                xyz = pair_ok(left[a], right[b])
+                if xyz is None:
+                    continue
+                pairs.append((a, b, xyz))
+                cost += abs(left[a].v - right[b].v)
+            # prefer more pairs, then lower row error, then preserved left-to-right order
+            us = [(left[a].u, right[b].u) for a, b, _ in pairs]
+            order_pen = sum(1 for i in range(len(us)) for j in range(len(us))
+                            if us[i][0] < us[j][0] and us[i][1] > us[j][1])
+            key = (-len(pairs), order_pen, cost)
+            if best_cost is None or key < best_cost:
+                best_cost, best = key, pairs
+        if len(left) > 6:
+            break
+    out = []
+    for a, b, xyz in best:
+        dl, dr = left[a], right[b]
+        out.append(StereoPoint(dl.marker_id, xyz, dl.u - dr.u, abs(dl.v - dr.v),
+                               (dl.u, dl.v), (dr.u, dr.v)))
     return out
 
 

@@ -1,15 +1,19 @@
 # Cameras (Optical Capture Subsystem)
 
-Tracks colored markers on the bat with a **StereoLabs ZED X (4 mm)** through a **ZED Link Duo** on a
-Jetson Orin / Orin Nano. It publishes each marker's 3D position to the fusion engine
-(`../Data Processing`) at up to 120 fps.
+Tracks **neon pink tape** on the bat with a **StereoLabs ZED X (4 mm)** through a **ZED Link Duo** on a
+Jetson Orin / Orin Nano. It publishes each pink point's 3D position, by name, to the fusion engine
+(`../dckft`) at up to 120 fps.
+
+Neon pink is the only default color (it tracked best under cage lighting). Since every band is
+the same color, bands are named by their **order along the bat** (`band_labeler.py`), not by color.
 
 ```
 ZED X ──GMSL2──> ZED Link Duo ──CSI──> Jetson
                                          │
    grab rectified L/R (SVGA @ 120 fps, manual exposure)
-   → detect markers in both images           (marker_detector.py)
-   → triangulate each marker                  (stereo.py)
+   → find the pink bands / stripe ends in both images   (marker_detector.py)
+   → pair them along epipolar rows, triangulate         (stereo.py)
+   → name them pink_1..N from the knob                  (band_labeler.py)
    → JSON payload → ZeroMQ PUSH :5557         (payload.py)
                   → optional JSONL log
 ```
@@ -21,8 +25,10 @@ ZED X ──GMSL2──> ZED Link Duo ──CSI──> Jetson
 | `bringup_check.py` | **Run first.** Opens the camera and verifies real fps, dropped frames, exposure, calibration, and IMU. |
 | `track_bat.py` | Main tracker. Works live or on a recorded `.svo2`, and can record while tracking. |
 | `zed_camera.py` | Thin ZED SDK wrapper: open live/SVO, manual exposure, grab, record, calibration, gravity estimate. |
-| `marker_detector.py` | HSV color-marker detector: coarse search at low resolution, then a full-resolution sub-pixel centroid. |
-| `stereo.py` | Rectified-stereo triangulation, depth-error model, and SDK point-cloud lookup. |
+| `marker_detector.py` | HSV detector: all pink bands (`detect_blobs`), stripe ends (`detect_stripe_ends`), or one blob per color (legacy); sub-pixel centroids. |
+| `band_labeler.py` | Names same-color pink points `pink_1..N` / `stripe_start`, `stripe_end` by order along the bat (spacing, continuity, gravity). |
+| `frame_points.py` | One frame → named 3D points: detect, match left/right, triangulate, label (testable without the ZED SDK). |
+| `stereo.py` | Rectified-stereo triangulation, same-color left/right matching (`match_unlabeled`), depth-error model, SDK point-cloud lookup. |
 | `payload.py` | Payload schema, non-blocking ZMQ PUSH publisher, and JSONL writer. |
 | `config.py` | All tunables as dataclasses, with JSON save/load. |
 | `legacy/` | The previous team's dual-Kinect sphere tracker, kept for reference. |
@@ -106,9 +112,10 @@ This keeps the legacy shape (`../Data Processing/legacy/sample_data/frame_payloa
   "ts_ns_wall":  1789657031158201113,
   "depth_source": "stereo",
   "points": [
-    {"id": "neon_pink", "pos": {"x": 0.299, "y": -0.085, "z": 2.994},
+    {"id": "pink_1", "pos": {"x": 0.299, "y": -0.085, "z": 2.994}, "color": "neon_pink",
      "disparity_px": 28.05, "row_err_px": 0.003,
-     "uv_left": [549.86, 280.2], "uv_right": [521.8, 280.2]}
+     "uv_left": [549.86, 280.2], "uv_right": [521.8, 280.2]},
+    {"id": "pink_2", "pos": {"x": 0.402, "y": -0.241, "z": 3.021}, "color": "neon_pink", "...": "..."}
   ]
 }
 ```
@@ -130,15 +137,32 @@ This keeps the legacy shape (`../Data Processing/legacy/sample_data/frame_payloa
 - config
 - the camera IMU's gravity estimate, for leveling the world frame. Confirm the IMU axis convention with a tilt test before relying on it.
 
-## Markers: important for the bat
+## Markers: neon pink only
 
-- **Tuning:** marker ids and starting hues come from the previous team (`neon_pink`, `neon_green`, `neon_yellow`, `neon_blue`). Re-tune `markers.hues` under the cage lighting and save it with `--save-config`.
-- **Roll is unobservable along the bat.** Markers placed only along the bat's length are nearly collinear. Horn's method (`Quaternion_Scheme_12_2.py`) needs **≥3 non-collinear points** for a full orientation. With collinear markers the camera gives position plus the bat's long axis, but not roll about that axis.
-  - **Option 1:** mount markers off-axis, for example on a small fin or cross at the knob.
-  - **Option 2:** let the IMU supply roll in the EKF.
-- **Update the model coordinates.** `MODEL` in `Quaternion_Scheme_12_2.py` still holds the old sphere's coordinates. Replace them with the measured positions of the bat markers.
-- **Marker size:** keep markers big enough to stay above `min_area_px` at the working distance.
-- **Glare:** matte tape reflects less than the painted sphere did, which was the previous team's range limiter.
+**Layouts** (`markers.layout` in the camera config):
+
+| Layout | On the bat | Published ids | Notes |
+|---|---|---|---|
+| `bands` (default) | `n_bands` separate pink bands (default 3) | `pink_1` (nearest the knob) … `pink_N` | Recommended. Use **unequal** spacing, e.g. 20 / 40 / 70 cm. |
+| `stripe` | one continuous pink stripe | `stripe_start` (knob end), `stripe_end` | Fast swings smear the stripe ends, so expect a little more error. |
+| `colors` | one blob per color (old scheme) | the color names | Kept as an option: set `hues` to several colors. |
+
+A single pink spot is **not** enough: the camera has to see the bat's direction, which takes at least two points.
+
+**How bands get their names** (`band_labeler.py`). The points of a frame lie on the bat line, so their order is known. What is left to decide is which end is the knob, and which bands are hidden. These cues settle it, in order:
+- **Spacing:** the measured band distances. Pass them with `--bat-config dckft_config.json`, or set `markers.band_s_m`. Unequal spacing gives every pair of bands a unique gap.
+- **Continuity:** each band's predicted position from the last frames.
+- **Gravity:** in the stance, the knob end is the lower end. This uses the ZED IMU's gravity estimate.
+
+Without spacing, labeling waits for a frame that shows every band, then learns the spacing.
+
+On 20 simulated swings with 15% of bands randomly hidden, 99.8–100% of the visible bands were named, and 0.015% were named wrongly.
+
+**Other notes:**
+- **Tuning:** re-tune `markers.hues["neon_pink"]` (default hue 170, `hue_tol` 7) under the cage lighting and save it with `--save-config`.
+- **Roll:** collinear bands give the bat's axis but not roll about it. The wrist IMU supplies roll in the EKF.
+- **Band size:** keep bands wide enough to stay above `min_area_px` at the working distance.
+- **Legacy pose solver:** `Quaternion_Scheme_12_2.py` (legacy) expects the old 4-sphere colors. Use `dckft` instead.
 
 ## Known limitations / next steps
 
