@@ -5,8 +5,8 @@
 > - The EKF, sync, metrics, and render all live there.
 > - This folder is kept for history: `fuse_imu_camera_data.py` was the first cross-correlation prototype;
 >   `legacy/` is the previous team's code.
-> - The legacy pose solver's `MODEL` still uses the old 4-sphere markers, so it can't solve the current
->   collinear bat markers. Use `dckft.data.bat_line_from_markers` instead.
+> - The legacy pose solver's `MODEL` still uses the old 4-sphere colors, so it can't solve the current
+>   neon-pink bands (`pink_1..3`). Use `dckft.data.bat_line_from_markers` instead.
 
 ## Status: math is reusable, integration will change
 
