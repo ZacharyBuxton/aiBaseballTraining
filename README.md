@@ -15,14 +15,17 @@ swing, a few headline metrics, and coaching notes within seconds of the swing.
 
 ```
 ZED X (SVGA@120) ──> Cameras/track_bat.py ──ZMQ :5557──┐
-  colored tape markers along the bat                   │      dckft.run live / process
+  neon pink tape bands along the bat                   │      dckft.run live / process
                                                        ├──>   sync → self-calibration → quaternion MEKF
 Wrist IMU (ICM45686 + ADXL375) ─900 MHz─> USB ──>      │      → trajectory → swing metrics → coaching
   dckft.imu.reader ──────────────────────ZMQ :5558─────┘      → 3D replay window + saved results
 ```
 
-1. **Camera.** `Cameras/track_bat.py` detects the three collinear tape markers in both images and
-   triangulates them. From these it gets the bat line (knob position and bat axis) at 120 Hz.
+1. **Camera.** All tape is **neon pink**, which tracked best under cage lighting.
+   - `Cameras/track_bat.py` finds the pink bands (default 3) in both images and triangulates them.
+   - Since the bands are all one color, it names them `pink_1` (nearest the knob) … `pink_3` by their order along the bat.
+   - From these it gets the bat line (knob position and bat axis) at 120 Hz.
+   - A single long pink stripe is also supported.
 2. **IMU.** `dckft.imu.reader` decodes the 30-byte radio frames at 400 Hz. Each sample is stamped
    with the Jetson clock, the same clock the camera uses.
 3. **Sync.** Cross-correlation gives a coarse offset. It is then refined jointly with the calibration,
@@ -112,10 +115,13 @@ tests/             pytest suite (cameras + fusion), runs in CI on every push
 Run `python -m dckft.run dump-config > dckft_config.json`, edit the values below, then pass
 `--config dckft_config.json`.
 
-- `bat.marker_s_m`: measured distance (m) of each tape marker's centre from the knob end.
+- `bat.marker_s_m`: measured distance (m) of each pink band's centre from the knob end: `pink_1` (nearest the
+  knob), `pink_2`, `pink_3`. Space them **unequally** (e.g. 20 / 40 / 70 cm). For a single stripe, use
+  `{"stripe_start": …, "stripe_end": …}` and set `markers.layout = "stripe"` in the camera config.
 - `bat.length_m`, `bat.sweet_spot_s_m`, `bat.imu_s_m`: bat length, sweet-spot position, and the
   wrist IMU's position along the handle.
-- Marker hues in `Cameras/` config, tuned under cage lighting (see `Cameras/README.md`).
+- The pink hue in the `Cameras/` config, tuned under cage lighting (see `Cameras/README.md`). Pass the same
+  `dckft_config.json` to the camera with `--bat-config`, so it can use the band spacing to name the bands.
 
 ## Docs
 

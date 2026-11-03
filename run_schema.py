@@ -113,7 +113,10 @@ def get_config(args, fusion_python):
             bat = config["bat"]
             bat["length_m"] = measure("Bat total length")
             for marker in bat["marker_s_m"]:
-                bat["marker_s_m"][marker] = measure(marker + " band CENTRE from knob")
+                what = ("stripe END NEAREST THE KNOB" if marker == "stripe_start" else
+                        "stripe END NEAREST THE BARREL" if marker == "stripe_end" else
+                        "pink band " + marker.replace("pink_", "#") + " CENTRE (counting from the knob)")
+                bat["marker_s_m"][marker] = measure(what + " from knob")
             bat["sweet_spot_s_m"] = measure("Barrel point where speed should be measured")
             bat["hands_s_m"] = measure("Hand reference point from knob")
             bat["imu_s_m"] = measure("Approximate wrist IMU projection along bat from knob")
@@ -376,7 +379,8 @@ def main(argv=None):
             str(session / "camera.svo2"), str(attempt / "camera_timestamps.json")], attempt)
         run_stage("detection", [camera_python, "-u", str(ROOT / "Cameras/track_bat.py"),
             "--svo", str(session / "camera.svo2"), "--config", str(session / "camera_config.json"),
-            "--no-zmq", "--jsonl", str(attempt / "camera.jsonl")], attempt)
+            "--no-zmq", "--jsonl", str(attempt / "camera.jsonl"),
+            "--bat-config", str(attempt / "fusion_config.json")], attempt)
         # summarize expects both raw IMU and analysis files together; read via an explicit argument.
         shutil.copy2(session / "imu.csv", attempt / "imu.csv")
         summarize(attempt)
