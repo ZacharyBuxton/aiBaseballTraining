@@ -157,8 +157,9 @@ def load_camera_jsonl(path: str, marker_ids=None) -> CameraData:
 # --------------------------------------------------------------------- bat line
 def bat_line_from_markers(cam: CameraData, bat: BatConfig):
     """
-    Per camera frame, solve for the knob point k and unit bat axis u (knob -> tip) from
-    collinear markers p_i = k + s_i * u, with s_i the measured distances from the knob.
+    Per camera frame, solve for the knob point k and unit bat axis u (knob -> tip) from the
+    pink points along the bat (bands pink_1..N, or the stripe's two ends):
+    p_i = k + s_i * u, with s_i the measured distances from the knob.
 
     >= 2 markers: least squares. Returns (knob (M,3), axis (M,3), n_markers (M,)) with NaN rows
     where fewer than two markers were seen. Roll about the axis is NOT observable from collinear
@@ -166,8 +167,10 @@ def bat_line_from_markers(cam: CameraData, bat: BatConfig):
     """
     ids = [m for m in bat.marker_s_m if m in cam.points]
     if len(ids) < 2:
-        raise ValueError(f"Need >= 2 configured markers in the camera data; have {ids}. "
-                         f"Configured: {list(bat.marker_s_m)}; seen: {list(cam.points)}")
+        raise ValueError(f"Need >= 2 configured pink points in the camera data; have {ids}. "
+                         f"Configured (bat.marker_s_m): {list(bat.marker_s_m)}; seen in the camera "
+                         f"file: {list(cam.points)}. The names must match the camera's marker layout "
+                         f"(bands -> pink_1..pink_N, stripe -> stripe_start/stripe_end).")
     P = np.stack([cam.points[m] for m in ids], axis=1)         # (M, K, 3)
     s = np.array([bat.marker_s_m[m] for m in ids])             # (K,)
     M = len(cam.t)

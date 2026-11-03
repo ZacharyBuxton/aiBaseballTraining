@@ -21,11 +21,16 @@ G = 9.80665
 
 @dataclass
 class BatConfig:
-    # Markers are collinear along the bat (current mounting). Distance from the knob end, metres.
+    # Neon pink tape only (Nov 2026). Each entry = one tracked point along the bat and its
+    # distance from the END OF THE KNOB, metres. Names must match what Cameras/track_bat.py
+    # publishes for the chosen layout:
+    #   bands  (default): pink_1 (nearest the knob), pink_2, pink_3 -- use UNEQUAL spacing
+    #   stripe:           {"stripe_start": <knob-side end>, "stripe_end": <barrel-side end>}
+    # At least two points are needed: the camera must see the bat's direction, not just a spot.
     marker_s_m: Dict[str, float] = field(default_factory=lambda: {
-        "neon_pink": 0.20,      # TODO measure
-        "magenta": 0.45,        # TODO measure
-        "neon_yellow": 0.70,    # TODO measure
+        "pink_1": 0.20,         # TODO measure
+        "pink_2": 0.40,         # TODO measure
+        "pink_3": 0.70,         # TODO measure
     })
     length_m: float = 0.838            # 33 in
     sweet_spot_s_m: float = 0.686      # ~6 in from the end cap

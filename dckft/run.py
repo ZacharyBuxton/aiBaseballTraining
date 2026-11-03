@@ -216,7 +216,9 @@ def cmd_postprocess(a, cfg: FusionConfig) -> int:
                "--jsonl", cam_jsonl, "--no-zmq", "--quiet"]
         if getattr(a, "cam_config", None):
             cmd += ["--config", a.cam_config]
-        print("Detecting markers in every recorded frame ...")
+        if getattr(a, "config", None):
+            cmd += ["--bat-config", a.config]      # measured pink band distances -> labeler
+        print("Detecting pink bands in every recorded frame ...")
         rc = subprocess.call(cmd, cwd=REPO_ROOT)
         if rc != 0 or not os.path.exists(cam_jsonl):
             print("[postprocess] marker detection on the SVO failed")

@@ -6,7 +6,7 @@
 | `config.py` | All tunables (bat geometry, IMU scaling, EKF noise, swing thresholds), JSON load/save |
 | `imu/frames.py` | 30-byte frame decode/encode, sync-word resync parser, tx-clock unwrap |
 | `imu/reader.py` | Serial/radio reader (Linux/Windows), ZMQ PUSH :5558, CSV, `--calibrate`, `--replay` |
-| `data.py` | Load camera JSONL / IMU CSV; device-clock → host-clock mapping; bat line from collinear markers |
+| `data.py` | Load camera JSONL / IMU CSV; device-clock → host-clock mapping; bat line from the pink bands (`pink_1..N` or stripe ends) |
 | `sync.py` | Cross-correlation time offset (bat-axis rate vs wrist rate) |
 | `calib.py` | Per-swing self-calibration: IMU orientation, grip vector, gyro bias, residual time offset |
 | `ekf.py` | Multiplicative quaternion EKF (gyro predict; camera-axis and gravity updates) + RTS backward smoother |
