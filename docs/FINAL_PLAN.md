@@ -5,8 +5,9 @@
 - **Compute.** The Jetson runs everything: camera, fusion, and render. The IMU receiver is being moved onto the Jetson.
 - **IMU.** The ICM45686 + ADXL375 is worn on the **wrist/hand**. The radio link works and carries the
   same 30-byte frames at 921600 baud.
-- **Markers.** Three colored tape markers sit **collinear** along the bat. The camera gives the bat axis
-  and knob; roll comes from the IMU.
+- **Markers.** **Neon pink tape only** (Nov 3: it tracked best). The default is 3 pink bands at unequal
+  distances, named `pink_1..3` by their order from the knob; a single stripe is also supported. The camera gives
+  the bat axis and the knob; roll comes from the IMU.
 - **Render.** A bat-only 3D replay in a Python desktop window (matplotlib).
 - **LLM coaching.** Deferred. Rule-based coaching is in place, with a hook for OpenRouter.
 
@@ -29,10 +30,14 @@
 | 13 | Per-marker gap filling from the IMU (`markers.py`, outputs tagged camera / imu_fill) | ✅ done (Oct 22) |
 | 14 | Record-then-process: `dckft.run capture` / `postprocess`, `track_bat.py --record-only` | ✅ done, needs a Jetson run |
 | 15 | Kalman RTS backward smoother; per-marker knob fixes; ADXL375 when the ICM clips | ✅ done (Oct 22) |
+| 16 | Neon-pink-only tracking: multi-band and stripe detection, same-color stereo matching, band labeler | ✅ done (Nov 3), needs a real-tape check |
 
 ## Remaining work, all on the real rig (in order)
 
-1. **Measure the bat** and put the values in the config: marker distances from the knob, length, and sweet spot.
+1. **Tape and measure the bat.**
+   - Use 3 neon pink bands at **unequal** distances from the knob (e.g. 20 / 40 / 70 cm), or decide on a single stripe.
+   - Put the distances in the config (`pink_1`, `pink_2`, `pink_3`), plus the bat length and sweet spot.
+   - Re-tune the pink hue under the cage lights.
 2. **Get the IMU reader running on the Jetson.**
    - Run `python -m dckft.imu.reader --list-ports`, then do a 5-second capture.
    - Confirm 400 Hz, no resyncs, and |accel| ≈ g at rest.

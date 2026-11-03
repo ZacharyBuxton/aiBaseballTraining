@@ -10,9 +10,14 @@ sudo usermod -aG dialout $USER             # serial access for the radio receive
 python -m dckft.run dump-config > dckft_config.json
 ```
 
+Tape the bat with **neon pink only**: 3 bands at unequal distances from the knob (e.g. 20 / 40 / 70 cm).
+
 Edit `dckft_config.json`:
-- `bat.marker_s_m`: measured marker distances from the knob, in metres.
+- `bat.marker_s_m`: measured band centres from the knob in metres. Use `pink_1` for the band nearest the
+  knob, then `pink_2` and `pink_3`.
 - `bat.length_m` and `bat.sweet_spot_s_m`.
+
+Pass the same file to the camera tracker with `--bat-config dckft_config.json`, so it can tell the bands apart by spacing.
 
 ## 1. Bring-up checks (5 min)
 
@@ -30,7 +35,7 @@ The IMU check passes when:
 ## 2a. Recommended: record now, process after (most accurate)
 
 ```bash
-python -m dckft.run capture --port /dev/ttyUSB0 --cam-config Cameras/cage.json   # Orin Nano: add --codec lossless-cpu
+python -m dckft.run --config dckft_config.json capture --port /dev/ttyUSB0 --cam-config Cameras/cage.json   # Orin Nano: add --codec lossless-cpu
 ```
 
 - While it runs, the camera records every frame with no marker detection, and the IMU logs every sample.
@@ -47,7 +52,7 @@ python -m dckft.run postprocess --session sessions/capture_YYYYmmdd_HHMMSS --red
 
 ```bash
 # T1: camera tracker (publishes on :5557)
-python Cameras/track_bat.py --config Cameras/cage.json --jsonl sessions/cam_$(date +%H%M).jsonl
+python Cameras/track_bat.py --config Cameras/cage.json --bat-config dckft_config.json --jsonl sessions/cam_$(date +%H%M).jsonl
 
 # T2: IMU reader (publishes on :5558)
 python -m dckft.imu.reader --port /dev/ttyUSB0 --csv sessions/imu_$(date +%H%M).csv
@@ -79,7 +84,9 @@ python -m dckft.run process --cam sessions/session_X/camera.jsonl --imu sessions
 |---|---|
 | `only N camera frames in the window` | `track_bat.py` isn't running/publishing, or markers aren't detected (check `--preview`) |
 | No swing detected | Swing faster, or lower `swing.trigger_rads` in the config (default 10 rad/s) |
-| `Not enough camera bat-axis samples` | Fewer than 2 markers visible; re-tune hues or improve lighting |
+| `Not enough camera bat-axis samples` | Fewer than 2 pink bands visible; re-tune the pink hue or improve lighting |
+| `Need >= 2 configured pink points` | The band names in `bat.marker_s_m` don't match the camera's layout (`pink_1..N` or `stripe_start/stripe_end`) |
+| Bands swapped (bat looks reversed) | Space the bands unequally, pass `--bat-config`, and hold still in the stance at the start |
 | `calib_rms_axis_deg` > 8 in `swing.json` | Markers mis-detected or grip slipped; re-check marker distances in config |
 | Live is slow / dropped frames warning | Record first (`track_bat.py --record x.svo2`), then process offline |
 | No hardware at all | `python -m dckft.run simulate` or replay a saved session: `python -m dckft.replay --cam ... --imu ...` with `dckft.run live` running |
