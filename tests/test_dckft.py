@@ -104,7 +104,7 @@ def test_bat_line_from_collinear_markers():
     cam = CameraData(np.array([0.0]), pts)
     knob, axis, n = bat_line_from_markers(cam, cfg.bat)
     assert n[0] == 3 and np.allclose(knob[0], k) and np.allclose(axis[0], u)
-    pts["magenta"][:] = np.nan          # two markers still enough
+    pts["pink_2"][:] = np.nan           # two bands still enough
     knob, axis, n = bat_line_from_markers(CameraData(np.array([0.0]), pts), cfg.bat)
     assert n[0] == 2 and np.allclose(axis[0], u)
 
@@ -196,10 +196,10 @@ def test_no_swing_raises(sim_session, tmp_path):
 
 def test_config_roundtrip(tmp_path):
     cfg = FusionConfig()
-    cfg.bat.marker_s_m["neon_pink"] = 0.123
+    cfg.bat.marker_s_m["pink_1"] = 0.123
     save_config(cfg, str(tmp_path / "c.json"))
     cfg2 = load_config(str(tmp_path / "c.json"))
-    assert cfg2.bat.marker_s_m["neon_pink"] == 0.123
+    assert cfg2.bat.marker_s_m["pink_1"] == 0.123
     with open(tmp_path / "bad.json", "w") as f:
         json.dump({"bat": {"nope": 1}}, f)
     with pytest.raises(KeyError):
