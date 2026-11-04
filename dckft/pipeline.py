@@ -25,6 +25,7 @@ from .ekf import EkfResult, run_ekf
 from .markers import MarkerFill, fill_markers, write_outputs as write_marker_outputs
 from .metrics import SwingMetrics, compute_metrics
 from .quality import clean_camera, optical_support
+from .replay_fill import ReplayFill, build_replay
 from .swing import Swing, detect_swings
 from .sync import axis_rate, estimate_offset
 from .trajectory import Trajectory, build_trajectory
@@ -69,6 +70,7 @@ class SwingResult:
     cam_axis: Optional[np.ndarray] = None
     markers: Optional[MarkerFill] = None
     camera_rejected: int = 0
+    replay: Optional[ReplayFill] = None
 
     def diagnostics(self) -> dict:
         e = self.ekf
@@ -80,6 +82,11 @@ class SwingResult:
             "swing_end_s": self.swing.t_end,
             "speed_reliable": self.metrics.speed_reliable,
             "speed_note": self.metrics.speed_note,
+            "replay": ({"estimated_samples": int(self.replay.estimated.sum()),
+                        "total_samples": len(self.replay.traj.t),
+                        "max_distance_to_camera_support_s": round(float(self.replay.nearest_support_s.max()), 4),
+                        "method": "wrist IMU prediction with camera endpoint constraints; estimates are not measurements"}
+                       if self.replay is not None else None),
             "calib_rms_axis_deg": round(self.calib.rms_axis_deg, 2),
             "calib_rms_gravity_deg": (None if np.isnan(self.calib.rms_gravity_deg)
                                       else round(self.calib.rms_gravity_deg, 2)),
@@ -122,6 +129,26 @@ class SwingResult:
                             int(self.swing.t_onset <= tr.t[k] <= self.swing.t_end)])
         if self.markers is not None:
             write_marker_outputs(self.markers, out_dir, self.swing.t_onset)
+        if self.replay is not None:
+            rp = self.replay
+            rt = rp.traj
+            tip, sweet = rt.point(bat_cfg.length_m), rt.point(bat_cfg.sweet_spot_s_m)
+            with open(os.path.join(out_dir, "replay.csv"), "w", newline="") as f:
+                w = csv.writer(f)
+                ids = list(bat_cfg.marker_s_m)
+                marker_pos = {m: rt.point(bat_cfg.marker_s_m[m]) for m in ids}
+                w.writerow(["t_s", "knob_x", "knob_y", "knob_z", "axis_x", "axis_y", "axis_z",
+                            "tip_x", "tip_y", "tip_z", "sweet_x", "sweet_y", "sweet_z"] +
+                           [f"{m}_{d}" for m in ids for d in "xyz"] +
+                           ["pose_source", "nearest_camera_support_s", "imu_accel_used", "speed_valid", "in_swing"])
+                for k in range(len(rt.t)):
+                    w.writerow([round(rt.t[k]-self.swing.t_onset, 6),
+                                *np.round(rt.knob[k], 5), *np.round(rt.axis[k], 5),
+                                *np.round(tip[k], 5), *np.round(sweet[k], 5),
+                                *[round(float(x), 5) for m in ids for x in marker_pos[m][k]],
+                                "imu_estimate" if rp.estimated[k] else "camera_supported_fusion",
+                                round(float(rp.nearest_support_s[k]), 6), int(rp.accel_used[k]),
+                                int(rt.valid[k]), int(self.swing.t_onset <= rt.t[k] <= self.swing.t_end)])
         return summary
 
 
@@ -230,12 +257,15 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
              else [metrics.speed_note])
     tm["metrics"] = (time.perf_counter() - t1) * 1e3
     marker_fill = fill_markers(traj, cfg.bat, cam.t[cm], {m: p[cm] for m, p in cam.points.items()})
+    # Keep the conservative metric trajectory intact. Replay may fill its unsupported
+    # gaps, but doing so must never manufacture optical support or a trusted speed.
+    replay_fill = build_replay(traj, acc_world, acc_valid) if traj.valid.any() else None
     tm["total"] = (time.perf_counter() - t_start) * 1e3
 
     res = SwingResult(swing=sw, metrics=metrics, notes=notes, traj=traj, ekf=ekf, calib=cal, up=up,
                       time_offset_s=offset, sync_corr=corr, camera_coverage=coverage,
                       timings_ms=tm, cam_t=t_cam, cam_knob=knob_w, cam_axis=axis_w,
-                      markers=marker_fill, camera_rejected=rejected)
+                      markers=marker_fill, camera_rejected=rejected, replay=replay_fill)
     if verbose:
         print(json.dumps(res.diagnostics(), indent=2))
     return res
