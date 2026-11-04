@@ -87,7 +87,7 @@ class MarkerConfig:
     band_s_m: Optional[List[float]] = None
     label_gate_m: float = 0.25          # max jump (m) per frame for a band to keep its label
     hue_tol: int = 7
-    s_min: int = 150
+    s_min: int = 120                    # Nov 4 rig: right-view pink S ~138; 150 fragments bands
     s_max: int = 255
     v_min: int = 120
     v_max: int = 255
@@ -139,3 +139,4 @@ def load_config(path: Optional[str] = None) -> Config:
 def save_config(cfg: Config, path: str) -> None:
     with open(path, "w") as f:
         json.dump(cfg.to_dict(), f, indent=2)
+
