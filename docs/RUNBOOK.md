@@ -136,9 +136,12 @@ at 150); existing saved camera configs override that default.
 ### Continuous IMU-assisted replay
 
 After successful camera/IMU calibration, replay keeps a pose at every available IMU sample
-through swing end. Pink shows camera-supported fusion. Orange dashed bat/path sections show
-estimated motion while the camera is hidden. The fused gyro supplies bat-axis prediction;
-gravity/lever-arm-corrected wrist acceleration supplies translation prediction. For gaps
+through swing end. Pink shows camera-constrained poses. Orange dashed bat/path sections show
+estimated motion while the camera is hidden. The cleaned camera marker positions and
+measured band distances define each available bat line. These camera poses anchor the
+display at their exact timestamps. Short optical intervals use linear position interpolation
+and shortest-arc axis interpolation. Across actual gaps, the fused gyro supplies bat-axis
+prediction and corrected wrist acceleration supplies translation prediction. For gaps
 with camera support on both sides, a smooth cubic endpoint correction constrains predicted
 position and velocity to the next supported segment. This uses future observations offline.
 Unbounded edges dead-reckon from the nearest supported pose; unusable acceleration coasts.
@@ -152,6 +155,15 @@ not invented camera frame times. `swing.json` includes a replay estimate count a
 The conservative `fused.csv`, marker exports, and headline metrics retain their support flags;
 filling a display gap does not validate a speed. Long gaps may still make speed unavailable.
 If there is no supported camera anchor, the continuous replay cannot be established.
+
+Pose support and speed validity are separate. The 40 ms reacquisition guard can withhold
+speed without replacing a camera-constrained display pose. An isolated camera bat line
+anchors the gap predictor even when the speed mask is invalid. The render's distance to
+camera support now means distance to an actual usable camera bat-line timestamp.
+`replay.csv` uses `pose_source` for pose provenance and `speed_valid` for metric eligibility.
+`swing.json` reports both active-swing fractions, original fused-marker residuals, replay
+marker residuals against the optical measurements, and camera/analysis time ranges. Residuals
+measure agreement with camera observations, not independent ground-truth accuracy.
 
 For an end-on view, an end-cap patch can provide a visible point but cannot determine the bat
 axis alone. The current three-band tracker selects three pink blobs; do not add a fourth
