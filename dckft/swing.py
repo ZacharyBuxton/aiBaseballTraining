@@ -69,25 +69,32 @@ def detect_swings(t: np.ndarray, gyro: np.ndarray, accel_hg: np.ndarray,
         if not above[i]:
             i += 1
             continue
-        j = i
-        while j < n and m[j] > cfg.end_rads:
+        # End the event at the START of a sustained low-rate period. Brief dips during a
+        # swing do not split it, but picking the bat up again must not extend its end.
+        j, quiet_start = i, None
+        while j < n and t[j] - t[i] < cfg.max_duration_s:
+            if m[j] <= cfg.end_rads:
+                if quiet_start is None:
+                    quiet_start = j
+                if t[j] - t[quiet_start] >= cfg.end_hold_s:
+                    break
+            else:
+                quiet_start = None
             j += 1
-        seg = slice(i, j)
+        event_end = quiet_start if quiet_start is not None else min(j, n - 1)
+        seg = slice(i, max(i + 1, event_end + 1))
         k_peak = i + int(np.argmax(m[seg]))
         k_on = i
         while k_on > 0 and m[k_on] > cfg.onset_rads:
             k_on -= 1
-        k_end = min(j, n - 1)
+        k_end = event_end
         hits = impact_indices(accel_hg[k_on:k_end + 1], rate, cfg.contact_hg_ms2)
         t_contact = float(t[k_on + hits[0]]) if len(hits) else None
         sw = Swing(float(t[k_on]), float(t[k_peak]), float(t[k_end]), t_contact, float(m[k_peak]))
         if swings and sw.t_onset - swings[-1].t_end < cfg.min_gap_s:
-            # merge with the previous (same swing, e.g. follow-through re-acceleration)
-            prev = swings[-1]
-            if sw.peak_rads > prev.peak_rads:
-                prev.t_peak, prev.peak_rads = sw.t_peak, sw.peak_rads
-            prev.t_end = sw.t_end
-            prev.t_contact = prev.t_contact or sw.t_contact
+            # Cooldown suppresses return-to-stance movement; never merge it into the
+            # completed swing (that used to move the speed peak and replay end).
+            pass
         else:
             swings.append(sw)
         i = j + 1
@@ -114,3 +121,4 @@ class LiveSwingDetector:
             self.last_swing_end = s.t_end
             return s
         return None
+

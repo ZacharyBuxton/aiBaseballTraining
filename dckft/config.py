@@ -92,6 +92,10 @@ class SwingConfig:
     pre_roll_s: float = 1.0             # data kept before onset (stance -> calibration)
     post_roll_s: float = 0.4
     contact_hg_ms2: float = 300.0       # ADXL375 spike threshold for ball contact (~30 g)
+    end_hold_s: float = 0.10           # finish after sustained low wrist rate
+    max_duration_s: float = 1.2        # bound one swing; reset movement starts a new event
+    max_camera_gap_s: float = 0.06     # longer optical gaps are NOT reliable speed samples
+    reacquire_guard_s: float = 0.04    # exclude both edges of a long gap from speed metrics
 
 
 @dataclass
@@ -152,3 +156,4 @@ def load_config(path: Optional[str] = None) -> FusionConfig:
 def save_config(cfg: FusionConfig, path: str) -> None:
     with open(path, "w") as f:
         json.dump(cfg.to_dict(), f, indent=2)
+

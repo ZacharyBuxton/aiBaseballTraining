@@ -62,6 +62,8 @@ class MarkerFill:
     t: np.ndarray
     t_cam: np.ndarray
     tracks: Dict[str, MarkerTrack] = field(default_factory=dict)
+    supported: np.ndarray = None
+    cam_supported: np.ndarray = None
 
     def summary(self, window) -> dict:
         return {m: tr.summary(self.t_cam, window) for m, tr in self.tracks.items()}
@@ -88,6 +90,8 @@ def fill_markers(traj: Trajectory, bat: BatConfig, t_cam: np.ndarray,
     inside = (t_cam >= traj.t[0]) & (t_cam <= traj.t[-1])
     tc = t_cam[inside]
     out = MarkerFill(t=traj.t, t_cam=tc)
+    out.supported = np.ones(len(traj.t), bool) if traj.valid is None else traj.valid.copy()
+    out.cam_supported = np.interp(tc, traj.t, out.supported.astype(float)) >= .999
     for mid, s in bat.marker_s_m.items():
         filled = traj.point(s)
         cam_f = np.column_stack([np.interp(tc, traj.t, filled[:, j]) for j in range(3)])
@@ -104,10 +108,11 @@ def write_outputs(fill: MarkerFill, out_dir: str, t0: float, camera_id: str = "f
     ids = list(fill.tracks)
     with open(os.path.join(out_dir, "markers.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["t_s"] + [f"{m}_{a}" for m in ids for a in "xyz"])
+        w.writerow(["t_s"] + [f"{m}_{a}" for m in ids for a in "xyz"] + ["pose_supported"])
         for k in range(len(fill.t)):
             w.writerow([round(fill.t[k] - t0, 6)] +
-                       [round(float(v), 5) for m in ids for v in fill.tracks[m].filled[k]])
+                       [round(float(v), 5) for m in ids for v in fill.tracks[m].filled[k]] +
+                       [int(fill.supported[k])])
     with open(os.path.join(out_dir, "markers_camera.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["t_s"] + [c for m in ids for c in (f"{m}_x", f"{m}_y", f"{m}_z", f"{m}_src")])
@@ -116,7 +121,9 @@ def write_outputs(fill: MarkerFill, out_dir: str, t0: float, camera_id: str = "f
             for m in ids:
                 tr = fill.tracks[m]
                 p = tr.cam_measured[i] if tr.cam_seen[i] else tr.cam_filled[i]
-                row += [round(float(v), 5) for v in p] + ["camera" if tr.cam_seen[i] else "imu_fill"]
+                source = ("camera" if tr.cam_seen[i] else
+                          "imu_fill" if fill.cam_supported[i] else "unsupported")
+                row += [round(float(v), 5) for v in p] + [source]
             w.writerow(row)
     with open(os.path.join(out_dir, "camera_filled.jsonl"), "w") as f:
         for i in range(len(fill.t_cam)):
@@ -126,7 +133,9 @@ def write_outputs(fill: MarkerFill, out_dir: str, t0: float, camera_id: str = "f
                 tr = fill.tracks[m]
                 p = tr.cam_measured[i] if tr.cam_seen[i] else tr.cam_filled[i]
                 pts.append({"id": m, "pos": {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])},
-                            "source": "camera" if tr.cam_seen[i] else "imu_fill"})
+                            "source": ("camera" if tr.cam_seen[i] else
+                                       "imu_fill" if fill.cam_supported[i] else "unsupported")})
             f.write(json.dumps({"schema_version": "1.1", "coord_sys": "zedx_left_rect_opencv_meters_v1",
                                 "camera_id": camera_id, "frame_id": i, "ts_ns_image": ts,
                                 "ts_ns_mono": ts, "points": pts}) + "\n")
+

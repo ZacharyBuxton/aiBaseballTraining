@@ -43,9 +43,13 @@ class SwingMetrics:
     t_onset: float
     t_contact: float
     contact_detected: bool
+    speed_reliable: bool = True
+    speed_note: str = ""
+    speed_valid_fraction: float = 1.0
 
     def to_dict(self) -> dict:
-        return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in asdict(self).items()}
+        return {k: ((round(v, 4) if np.isfinite(v) else None) if isinstance(v, float) else v)
+                for k, v in asdict(self).items()}
 
 
 def _angle_to_horizontal(v: np.ndarray, up: np.ndarray) -> float:
@@ -60,20 +64,32 @@ def compute_metrics(traj: Trajectory, omega_world: np.ndarray, swing: Swing, bat
     up = np.asarray(up, float) / np.linalg.norm(up)
     t = traj.t
     ss_speed = traj.speed(bat.sweet_spot_s_m)
+    valid = np.isfinite(ss_speed)
+    if traj.valid is not None:
+        valid &= traj.valid
+    active = (t >= swing.t_onset) & (t <= swing.t_end)
 
     contact_detected = t_contact is not None or swing.t_contact is not None
     if t_contact is None:
         t_contact = swing.t_contact
     if t_contact is None:
         # dry swing: contact := time of peak sweet-spot speed between onset and swing end
-        m = (t >= swing.t_onset) & (t <= swing.t_end)
+        m = active & valid
         t_contact = float(t[m][np.argmax(ss_speed[m])]) if m.any() else swing.t_peak
 
     k_c = int(np.clip(np.searchsorted(t, t_contact), 0, len(t) - 1))
     # Impact itself rattles the IMU, so read contact kinematics 2.5 ms *before* the spike.
-    k_c_pre = max(0, k_c - max(1, int(round(0.0025 / np.median(np.diff(t))))))
+    k_c_pre = (max(0, k_c - max(1, int(round(0.0025 / np.median(np.diff(t))))))
+               if contact_detected else k_c)
 
-    pre = (t >= swing.t_onset) & (t <= t[k_c_pre])
+    pre = (t >= swing.t_onset) & (t <= t[k_c_pre]) & valid
+    fraction = float(valid[active].mean()) if active.any() else 0.0
+    peak_window = active & (abs(t-swing.t_peak) <= .08)
+    peak_support = float(valid[peak_window].mean()) if peak_window.any() else 0.0
+    reliable = bool(valid[k_c_pre] and (active & valid).sum() >= 5 and peak_support >= .8)
+    note = ("Model estimate with optical support; not independently validated." if reliable else
+            "Speed unavailable: insufficient optical support at contact/wrist peak. "
+            "Occlusion and reacquisition are excluded; no speed is inferred across a long gap.")
     v_ss = traj.velocity(bat.sweet_spot_s_m)
     hands_speed = traj.speed(bat.hands_s_m)
 
@@ -97,11 +113,11 @@ def compute_metrics(traj: Trajectory, omega_world: np.ndarray, swing: Swing, bat
 
     wrist = np.linalg.norm(omega_world, axis=1)
     return SwingMetrics(
-        bat_speed_mph=float(ss_speed[k_c_pre] * MPS_TO_MPH),
-        peak_bat_speed_mph=float(ss_speed[pre].max() * MPS_TO_MPH) if pre.any() else float("nan"),
-        peak_hand_speed_mph=float(hands_speed[pre].max() * MPS_TO_MPH) if pre.any() else float("nan"),
-        attack_angle_deg=_angle_to_horizontal(v_ss[k_c_pre], up),
-        vertical_bat_angle_deg=_angle_to_horizontal(traj.axis[k_c_pre], up),
+        bat_speed_mph=float(ss_speed[k_c_pre] * MPS_TO_MPH) if reliable else float("nan"),
+        peak_bat_speed_mph=float(ss_speed[pre].max() * MPS_TO_MPH) if reliable else float("nan"),
+        peak_hand_speed_mph=float(hands_speed[pre].max() * MPS_TO_MPH) if reliable else float("nan"),
+        attack_angle_deg=_angle_to_horizontal(v_ss[k_c_pre], up) if reliable else float("nan"),
+        vertical_bat_angle_deg=_angle_to_horizontal(traj.axis[k_c_pre], up) if reliable else float("nan"),
         time_to_contact_s=float(t_contact - swing.t_onset),
         swing_plane_tilt_deg=tilt,
         peak_wrist_rate_dps=float(np.degrees(wrist[pre].max())) if pre.any() else float("nan"),
@@ -109,4 +125,8 @@ def compute_metrics(traj: Trajectory, omega_world: np.ndarray, swing: Swing, bat
         t_onset=float(swing.t_onset),
         t_contact=float(t_contact),
         contact_detected=bool(contact_detected),
+        speed_reliable=reliable,
+        speed_note=note,
+        speed_valid_fraction=fraction,
     )
+

@@ -13,6 +13,7 @@ trajectory.py -- bat point positions/velocities at IMU rate.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 from scipy.interpolate import make_smoothing_spline
@@ -25,6 +26,7 @@ class Trajectory:
     knob_vel: np.ndarray
     axis: np.ndarray
     axis_rate: np.ndarray     # du/dt
+    valid: Optional[np.ndarray] = None  # reliable optical support; gaps remain estimates
 
     def point(self, s: float) -> np.ndarray:
         return self.knob + s * self.axis
@@ -186,7 +188,7 @@ def knob_from_markers(t_cam, marker_pts, marker_s, t_imu, u_imu):
 
 def build_trajectory(t_imu, axis, omega_world, t_cam, knob_cam, lam=None,
                      acc_world=None, axis_cam=None, flex_lam=2e-6, acc_valid=None,
-                     marker_pts=None, marker_s=None) -> Trajectory:
+                     marker_pts=None, marker_s=None, max_gap_s=.06) -> Trajectory:
     # 1) bat axis: fused (smoothed) IMU orientation + camera flex correction
     u = axis / np.linalg.norm(axis, axis=1, keepdims=True)
     omega = np.asarray(omega_world, float)
@@ -198,10 +200,30 @@ def build_trajectory(t_imu, axis, omega_world, t_cam, knob_cam, lam=None,
     meas_n = None
     if marker_pts is not None and marker_s:
         knob_cam, meas_n = knob_from_markers(t_cam, marker_pts, marker_s, t_imu, u)
-    if acc_world is not None:
-        knob, knob_vel = kalman_knob(t_imu, acc_world, t_cam, knob_cam, acc_valid=acc_valid,
-                                     meas_n=meas_n)
-    else:
-        knob, knob_vel = smooth_positions(t_cam, knob_cam, t_imu, lam)
+    # Restart translation smoothing at long occlusions. A reacquired location must not
+    # pull earlier velocities through the whole recording in the backward RTS pass.
+    seen = np.flatnonzero(np.isfinite(knob_cam).all(axis=1))
+    if len(seen) < 3:
+        raise ValueError("Not enough knob fixes for the trajectory")
+    groups = np.split(seen, np.where(np.diff(t_cam[seen]) > max_gap_s)[0]+1)
+    edges = [(t_cam[a[-1]]+t_cam[b[0]])/2 for a,b in zip(groups[:-1],groups[1:])]
+    ownership = np.searchsorted(edges, t_imu)
+    knob, knob_vel = np.empty((len(t_imu),3)), np.empty((len(t_imu),3))
+    for j, indices in enumerate(groups):
+        out = ownership == j
+        if not out.any():
+            continue
+        tc, pc = t_cam[indices], knob_cam[indices]
+        if len(indices) < (3 if acc_world is not None else 6) or out.sum() < 3:
+            pos = np.column_stack([np.interp(t_imu[out],tc,pc[:,d]) for d in range(3)])
+            vel = np.gradient(pos,t_imu[out],axis=0) if out.sum()>1 else np.zeros_like(pos)
+        elif acc_world is not None:
+            pos, vel = kalman_knob(t_imu[out],acc_world[out],tc,pc,
+                acc_valid=None if acc_valid is None else acc_valid[out],
+                meas_n=None if meas_n is None else meas_n[indices])
+        else:
+            pos, vel = smooth_positions(tc,pc,t_imu[out],lam)
+        knob[out], knob_vel[out] = pos, vel
     du = np.cross(omega, u)
     return Trajectory(t=np.asarray(t_imu), knob=knob, knob_vel=knob_vel, axis=u, axis_rate=du)
+

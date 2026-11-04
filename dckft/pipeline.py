@@ -24,6 +24,7 @@ from .data import CameraData, ImuData, bat_line_from_markers
 from .ekf import EkfResult, run_ekf
 from .markers import MarkerFill, fill_markers, write_outputs as write_marker_outputs
 from .metrics import SwingMetrics, compute_metrics
+from .quality import clean_camera, optical_support
 from .swing import Swing, detect_swings
 from .sync import axis_rate, estimate_offset
 from .trajectory import Trajectory, build_trajectory
@@ -67,6 +68,7 @@ class SwingResult:
     cam_knob: Optional[np.ndarray] = None
     cam_axis: Optional[np.ndarray] = None
     markers: Optional[MarkerFill] = None
+    camera_rejected: int = 0
 
     def diagnostics(self) -> dict:
         e = self.ekf
@@ -74,6 +76,10 @@ class SwingResult:
             "time_offset_ms": round(self.time_offset_s * 1e3, 2),
             "sync_correlation": round(self.sync_corr, 3),
             "camera_coverage": round(self.camera_coverage, 3),
+            "camera_frames_rejected": self.camera_rejected,
+            "swing_end_s": self.swing.t_end,
+            "speed_reliable": self.metrics.speed_reliable,
+            "speed_note": self.metrics.speed_note,
             "calib_rms_axis_deg": round(self.calib.rms_axis_deg, 2),
             "calib_rms_gravity_deg": (None if np.isnan(self.calib.rms_gravity_deg)
                                       else round(self.calib.rms_gravity_deg, 2)),
@@ -104,13 +110,16 @@ class SwingResult:
             w = csv.writer(f)
             w.writerow(["t_s", "qw", "qx", "qy", "qz", "knob_x", "knob_y", "knob_z",
                         "axis_x", "axis_y", "axis_z", "tip_x", "tip_y", "tip_z",
-                        "sweet_x", "sweet_y", "sweet_z", "sweet_speed_mps", "att_std_deg"])
+                        "sweet_x", "sweet_y", "sweet_z", "sweet_speed_mps", "att_std_deg",
+                        "speed_valid", "in_swing"])
             t0 = self.swing.t_onset
             for k in range(len(tr.t)):
                 w.writerow([round(tr.t[k] - t0, 6), *np.round(self.ekf.q[k], 6),
                             *np.round(tr.knob[k], 5), *np.round(tr.axis[k], 5),
                             *np.round(tip[k], 5), *np.round(ss[k], 5), round(float(spd[k]), 4),
-                            round(float(self.ekf.att_std_deg[k]), 3)])
+                            round(float(self.ekf.att_std_deg[k]), 3),
+                            int(tr.valid[k]) if tr.valid is not None else 1,
+                            int(self.swing.t_onset <= tr.t[k] <= self.swing.t_end)])
         if self.markers is not None:
             write_marker_outputs(self.markers, out_dir, self.swing.t_onset)
         return summary
@@ -121,6 +130,7 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
     tm = {}
     t_start = time.perf_counter()
 
+    cam, rejected = clean_camera(cam, cfg.bat.marker_s_m)
     knob_c, axis_c, count = bat_line_from_markers(cam, cfg.bat)
     g = cam.gravity_cam if cam.gravity_cam is not None else np.asarray(cfg.gravity_cam, float)
     up = -np.asarray(g, float) / np.linalg.norm(g)
@@ -137,13 +147,15 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
     t1 = time.perf_counter()
     offset, corr = cfg.sync.fixed_offset_s, 0.0
     if cfg.sync.use_xcorr:
-        cam_rate = axis_rate(cam.t, axis_c)
         imu_rate = np.linalg.norm(imu.gyro, axis=1)
         if imu.has_host_clock:
-            win = (sw.t_onset - 0.3, sw.t_end + 0.3)
-            offset, corr = estimate_offset(cam.t, cam_rate, imu.t, imu_rate,
+            sync_camera = (cam.t >= sw.t_onset - .3 - cfg.sync.max_offset_s) & (cam.t <= sw.t_end)
+            cam_rate = axis_rate(cam.t[sync_camera], axis_c[sync_camera])
+            win = (sw.t_onset - 0.3, sw.t_end)
+            offset, corr = estimate_offset(cam.t[sync_camera], cam_rate, imu.t, imu_rate,
                                            cfg.sync.max_offset_s, window=win)
         else:
+            cam_rate = axis_rate(cam.t, axis_c)
             # Legacy CSV: IMU time starts at 0, so search the whole camera span.
             span = (cam.t[-1] - cam.t[0]) + (imu.t[-1] - imu.t[0])
             imu0 = imu.shifted(cam.t[0] - imu.t[0])
@@ -155,12 +167,20 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
     tm["sync"] = (time.perf_counter() - t1) * 1e3
 
     # ---- window
-    w0, w1 = sw.t_onset - cfg.swing.pre_roll_s, sw.t_end + cfg.swing.post_roll_s
+    # Keep stance for calibration, but STOP fusion/smoothing at swing end. Later held-bat
+    # observations must not pull the RTS solution or inflate the dry-swing speed peak.
+    w0, w1 = sw.t_onset - cfg.swing.pre_roll_s, sw.t_end
     win_imu = imu.slice(w0, w1)
-    cm = (cam.t >= w0 - 0.2) & (cam.t <= w1 + 0.2)
+    cm = (cam.t >= w0) & (cam.t <= w1)
     t_cam, knob_w, axis_w = cam.t[cm], knob_c[cm], axis_c[cm]
     in_swing = (cam.t >= sw.t_onset) & (cam.t <= sw.t_end)
-    coverage = float((count[in_swing] >= 2).mean()) if in_swing.any() else 0.0
+    # JSONL contains only published frames; its row count alone can report 100% despite
+    # a long complete dropout. Include absent frame slots in the denominator.
+    fps = float(cam.meta.get("camera", {}).get("fps", 0) or 0)
+    if fps <= 0 and len(cam.t)>1:
+        fps = 1.0/float(np.median(np.diff(cam.t)))
+    expected = max(1, int(round((sw.t_end-sw.t_onset)*fps))+1)
+    coverage = min(1.0, float(np.isfinite(axis_c[in_swing]).all(axis=1).sum())/expected)
 
     # ---- calibration + EKF
     t1 = time.perf_counter()
@@ -174,6 +194,10 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
         cal.t_ref += d
         sw = Swing(sw.t_onset + d, sw.t_peak + d, sw.t_end + d,
                    None if sw.t_contact is None else sw.t_contact + d, sw.peak_rads)
+        # Refinement shifts IMU times; still exclude all later optical observations.
+        keep = t_cam <= sw.t_end
+        t_cam, knob_w, axis_w = t_cam[keep], knob_w[keep], axis_w[keep]
+        cm &= cam.t <= sw.t_end
     tm["calibration"] = (time.perf_counter() - t1) * 1e3
     t1 = time.perf_counter()
     ekf = run_ekf(win_imu.t, win_imu.gyro, win_imu.accel, t_cam, axis_w, up, cal, cfg.ekf,
@@ -198,9 +222,12 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
                             lam=cfg.knob_spline_lam, acc_world=acc_world, axis_cam=axis_w,
                             flex_lam=cfg.flex_lam, acc_valid=acc_valid,
                             marker_pts={m: p[cm] for m, p in cam.points.items()},
-                            marker_s=cfg.bat.marker_s_m)
+                            marker_s=cfg.bat.marker_s_m, max_gap_s=cfg.swing.max_camera_gap_s)
+    traj.valid = optical_support(traj.t, t_cam[np.isfinite(axis_w).all(axis=1)],
+                                 cfg.swing.max_camera_gap_s, cfg.swing.reacquire_guard_s)
     metrics = compute_metrics(traj, ekf.omega_world, sw, cfg.bat, up)
-    notes = (coach or RuleBasedCoach()).notes(metrics)
+    notes = ((coach or RuleBasedCoach()).notes(metrics) if metrics.speed_reliable
+             else [metrics.speed_note])
     tm["metrics"] = (time.perf_counter() - t1) * 1e3
     marker_fill = fill_markers(traj, cfg.bat, cam.t[cm], {m: p[cm] for m, p in cam.points.items()})
     tm["total"] = (time.perf_counter() - t_start) * 1e3
@@ -208,7 +235,8 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
     res = SwingResult(swing=sw, metrics=metrics, notes=notes, traj=traj, ekf=ekf, calib=cal, up=up,
                       time_offset_s=offset, sync_corr=corr, camera_coverage=coverage,
                       timings_ms=tm, cam_t=t_cam, cam_knob=knob_w, cam_axis=axis_w,
-                      markers=marker_fill)
+                      markers=marker_fill, camera_rejected=rejected)
     if verbose:
         print(json.dumps(res.diagnostics(), indent=2))
     return res
+

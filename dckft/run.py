@@ -41,9 +41,12 @@ from .swing import LiveSwingDetector, detect_swings
 
 def _print_summary(res, out_dir=None):
     m = res.metrics
+    number = lambda v: f"{v:.1f}" if np.isfinite(v) else "unavailable"
     print(f"\n=== Swing @ {time.strftime('%H:%M:%S', time.localtime(m.t_contact))} ===")
-    print(f"  bat speed      {m.bat_speed_mph:6.1f} mph   (peak {m.peak_bat_speed_mph:.1f})")
-    print(f"  hand speed     {m.peak_hand_speed_mph:6.1f} mph")
+    print(f"  estimated barrel speed {number(m.bat_speed_mph)} mph   (peak {number(m.peak_bat_speed_mph)})")
+    print(f"  estimated hand speed   {number(m.peak_hand_speed_mph)} mph")
+    if not m.speed_reliable:
+        print(f"  [tracking quality] {m.speed_note}")
     print(f"  attack angle   {m.attack_angle_deg:+6.1f} deg")
     print(f"  vertical bat   {m.vertical_bat_angle_deg:+6.1f} deg")
     print(f"  time to contact {m.time_to_contact_s * 1e3:5.0f} ms   "
@@ -388,3 +391,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
