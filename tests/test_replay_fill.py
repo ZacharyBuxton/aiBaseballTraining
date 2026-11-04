@@ -7,7 +7,7 @@ import pytest
 from dckft.config import FusionConfig
 from dckft.data import load_camera_jsonl, load_imu_csv
 from dckft.pipeline import process_swing
-from dckft.replay_fill import build_replay
+from dckft.replay_fill import build_replay, camera_guided_replay
 from dckft.simulate import SimParams, simulate, write_session
 from dckft.trajectory import Trajectory
 
@@ -80,3 +80,52 @@ def test_gap_replay_export_and_render_keep_speed_unavailable(tmp_path):
     from dckft.render import render_swing
     render_swing(r, cfg.bat, cfg.render, str(tmp_path/'out'))
     assert (tmp_path/'out/swing.png').stat().st_size > 10000
+
+
+def test_camera_poses_override_biased_fusion_without_validating_speed():
+    tr = track()
+    tr.knob[:, 2] += .08  # mimic the observed 8 cm fusion/camera disagreement
+    tr.valid[:] = False  # a conservative speed mask must not hide camera poses
+    tc = np.arange(0, 1.001, .02)
+    pc = np.column_stack([tc*tc, tc*0, tc*0])
+    uc = np.tile([1., 0., 0.], (len(tc), 1))
+    rp = camera_guided_replay(tr, tc, pc, uc)
+    assert rp.pose_supported.all()
+    assert not rp.estimated.any()
+    assert not rp.traj.valid.any()
+    assert np.max(abs(rp.traj.knob[:, 2])) < 1e-12
+    assert np.allclose(rp.traj.axis, uc[0], atol=1e-10)
+    for i, time in enumerate(tc):
+        k = np.argmin(abs(tr.t-time))
+        assert np.allclose(rp.traj.knob[k], pc[i], atol=1e-10)
+    assert np.all(tr.knob[:, 2] == .08)
+
+
+def test_camera_gap_has_pose_support_up_to_edges_but_keeps_speed_guard():
+    tr = track()
+    tc = np.r_[np.arange(0,.301,.02), np.arange(.7,1.001,.02)]
+    pc = np.column_stack([tc*tc, tc*0, tc*0])
+    uc = np.tile([0., 1., 0.], (len(tc), 1))
+    tr.valid[(tr.t>.26) & (tr.t<.74)] = False
+    a = np.zeros_like(tr.knob); a[:, 0] = 2
+    rp = camera_guided_replay(tr, tc, pc, uc, a)
+    assert rp.pose_supported[(tr.t>.26) & (tr.t<=.3)].all()
+    assert rp.estimated[(tr.t>.31) & (tr.t<.69)].all()
+    assert not rp.traj.valid[(tr.t>.26) & (tr.t<.74)].any()
+    assert np.isfinite(rp.traj.knob).all()
+    assert np.max(np.linalg.norm(np.diff(rp.traj.knob,axis=0),axis=1)) < .012
+
+
+def test_exact_camera_times_and_isolated_anchor_are_used():
+    tr = track()
+    # Camera and IMU grids need not coincide. Exact camera times anchor the internal solve.
+    tc = np.array([.103, .123, .143, .503, .803, .823, .843])
+    pc = np.column_stack([tc, tc*0, tc*0])
+    uc = np.tile([0., 1., 0.], (len(tc), 1))
+    tr.knob_vel[:, 0] = 1
+    rp = camera_guided_replay(tr, tc, pc, uc)
+    k = np.argmin(abs(tr.t-.503))
+    assert rp.pose_supported[k]
+    assert rp.nearest_support_s[k] == pytest.approx(abs(tr.t[k]-.503))
+    assert np.allclose(rp.traj.knob[k], [tr.t[k],0,0], atol=.001)
+    assert np.array_equal(rp.traj.valid, tr.valid)
