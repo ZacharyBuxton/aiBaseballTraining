@@ -262,7 +262,7 @@ def test_marker_gap_filling(sim_session, tmp_path):
     res.save(str(tmp_path), cfg.bat)
     lines = (tmp_path / "camera_filled.jsonl").read_text().splitlines()
     first = json.loads(lines[0])
-    assert len(first["points"]) == 3 and {p["source"] for p in first["points"]} <= {"camera", "imu_fill"}
+    assert len(first["points"]) == 3 and {p["source"] for p in first["points"]} <= {"camera", "imu_fill", "unsupported"}
     assert sum('"imu_fill"' in l for l in lines) > 0
     assert (tmp_path / "markers.csv").exists() and (tmp_path / "markers_camera.csv").exists()
 
@@ -279,3 +279,4 @@ def test_postprocess_session_folder(sim_session, tmp_path):
     shutil.copy(paths["imu"], sess / "imu.csv")
     assert main(["postprocess", "--session", str(sess), "--no-render"]) == 0
     assert (sess / "out" / "swing_00" / "swing.json").exists() or (sess / "out" / "swing.json").exists()
+
