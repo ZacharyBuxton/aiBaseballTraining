@@ -25,7 +25,7 @@ from .ekf import EkfResult, run_ekf
 from .markers import MarkerFill, fill_markers, write_outputs as write_marker_outputs
 from .metrics import SwingMetrics, compute_metrics
 from .quality import clean_camera, optical_support
-from .replay_fill import ReplayFill, build_replay
+from .replay_fill import ReplayFill, camera_guided_replay
 from .swing import Swing, detect_swings
 from .sync import axis_rate, estimate_offset
 from .trajectory import Trajectory, build_trajectory
@@ -74,6 +74,17 @@ class SwingResult:
 
     def diagnostics(self) -> dict:
         e = self.ekf
+        active = (self.traj.t >= self.swing.t_onset) & (self.traj.t <= self.swing.t_end)
+        replay_residuals = {}
+        if self.replay is not None and self.markers is not None:
+            rt = self.replay.traj
+            for mid, marker in self.markers.tracks.items():
+                pos = rt.point(marker.s_m)
+                sampled = np.column_stack([np.interp(self.markers.t_cam,rt.t,pos[:,j]) for j in range(3)])
+                seen = marker.cam_seen & (self.markers.t_cam >= self.swing.t_onset)
+                residual = sampled[seen]-marker.cam_measured[seen]
+                replay_residuals[mid] = (round(float(np.sqrt(np.mean(np.sum(residual**2,axis=1))))*1000,2)
+                                         if len(residual) else None)
         return {
             "time_offset_ms": round(self.time_offset_s * 1e3, 2),
             "sync_correlation": round(self.sync_corr, 3),
@@ -84,10 +95,19 @@ class SwingResult:
             "speed_note": self.metrics.speed_note,
             "replay": ({"estimated_samples": int(self.replay.estimated.sum()),
                         "total_samples": len(self.replay.traj.t),
+                        "active_swing_samples": int(active.sum()),
+                        "active_camera_pose_fraction": (round(float(self.replay.pose_supported[active].mean()), 4)
+                                                        if active.any() else None),
+                        "active_speed_valid_fraction": (round(float(self.traj.valid[active].mean()), 4)
+                                                        if active.any() and self.traj.valid is not None else None),
                         "max_distance_to_camera_support_s": round(float(self.replay.nearest_support_s.max()), 4),
-                        "method": "wrist IMU prediction with camera endpoint constraints; estimates are not measurements"}
+                        "camera_marker_residual_rms_mm": replay_residuals,
+                        "method": "cleaned camera bat-line anchors and short-interval interpolation; wrist IMU/model fills optical gaps; speed validity is separate"}
                        if self.replay is not None else None),
             "calib_rms_axis_deg": round(self.calib.rms_axis_deg, 2),
+            "analysis_time_range_s": [float(self.traj.t[0]),float(self.traj.t[-1])],
+            "camera_window_time_range_s": ([float(self.cam_t[0]),float(self.cam_t[-1])]
+                                            if self.cam_t is not None and len(self.cam_t) else None),
             "calib_rms_gravity_deg": (None if np.isnan(self.calib.rms_gravity_deg)
                                       else round(self.calib.rms_gravity_deg, 2)),
             "grip_axis_imu": np.round(self.calib.grip_axis, 4).tolist(),
@@ -259,7 +279,8 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
     marker_fill = fill_markers(traj, cfg.bat, cam.t[cm], {m: p[cm] for m, p in cam.points.items()})
     # Keep the conservative metric trajectory intact. Replay may fill its unsupported
     # gaps, but doing so must never manufacture optical support or a trusted speed.
-    replay_fill = build_replay(traj, acc_world, acc_valid) if traj.valid.any() else None
+    replay_fill = camera_guided_replay(traj, t_cam, knob_w, axis_w, acc_world, acc_valid,
+                                      cfg.swing.max_camera_gap_s)
     tm["total"] = (time.perf_counter() - t_start) * 1e3
 
     res = SwingResult(swing=sw, metrics=metrics, notes=notes, traj=traj, ekf=ekf, calib=cal, up=up,

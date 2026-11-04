@@ -59,6 +59,7 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
     if last <= first:
         raise ValueError("Swing window is too short to render")
     valid = np.ones(len(t), bool) if tr.valid is None else tr.valid.copy()
+    pose_supported = valid if rp is None else rp.pose_supported
     active = (t >= sw.t_onset) & (t <= sw.t_end)
     speed = tr.speed(bat.sweet_spot_s_m) * MPS_TO_MPH
     finite = (np.isfinite(tr.knob).all(axis=1) & np.isfinite(tr.axis).all(axis=1)
@@ -80,10 +81,19 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
         fig.canvas.manager.set_window_title(title)
     ax = fig.add_axes([.02,.28,.64,.65], projection="3d")
     axs = fig.add_axes([.69,.36,.28,.42])
-    ax.plot(*path[first:last+1].T, color="darkorange", lw=2, ls="--", label="IMU/model gap estimate")
-    measured_path = path.copy()
-    measured_path[~valid] = np.nan
-    ax.plot(*measured_path[first:last+1].T, color="deeppink", lw=2, label="Camera-supported fusion")
+    segments = np.stack([path[first:last],path[first+1:last+1]],axis=1)
+    supported_segments = pose_supported[first:last] & pose_supported[first+1:last+1]
+    for mask,color,style,label in [
+            (supported_segments,"deeppink","-","Camera-constrained pose"),
+            (~supported_segments,"darkorange","--","IMU/model gap estimate")]:
+        finite_segments = np.isfinite(segments).all(axis=(1,2)) & mask
+        indices = np.flatnonzero(finite_segments)
+        runs = np.split(indices,np.where(np.diff(indices)>1)[0]+1)
+        for run in runs:
+            if len(run):
+                polyline = path[first+run[0]:first+run[-1]+2]
+                ax.plot(*polyline.T,color=color,lw=2,ls=style)
+        ax.plot([],[],[],color=color,ls=style,label=label)
     ax.legend(loc="lower left", fontsize=8)
     points = np.vstack([knob[first:last+1][visible[first:last+1]],
                         tip[first:last+1][visible[first:last+1]]])
@@ -113,7 +123,7 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
     def draw(k):
         k = int(np.clip(k, first, last))
         if visible[k]:
-            estimated = not valid[k]
+            estimated = not pose_supported[k]
             color = "darkorange" if estimated else "deeppink"
             line.set_color(color if estimated else "0.2")
             line.set_linestyle("--" if estimated else "-")
@@ -124,8 +134,10 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
             if estimated:
                 status.set_text("%.3f s | IMU/model estimate\n%.0f ms from camera support | speed withheld" %
                                 (trel[k], 1000*rp.nearest_support_s[k]))
+            elif valid[k]:
+                status.set_text("%.3f s | camera pose | estimate %.1f mph" % (trel[k], supported_speed[k]))
             else:
-                status.set_text("%.3f s | camera-supported %.1f mph" % (trel[k], supported_speed[k]))
+                status.set_text("%.3f s | camera pose | speed withheld" % trel[k])
         else:
             line.set_data_3d([],[],[]); dots.set_data_3d([],[],[])
             status.set_text("%.3f s | Tracking gap - pose/speed not shown" % trel[k])
