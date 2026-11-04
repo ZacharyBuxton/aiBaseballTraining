@@ -97,3 +97,38 @@ python -m dckft.run process --cam sessions/session_X/camera.jsonl --imu sessions
 python -m dckft.run live --session-dir /tmp/live &
 python -m dckft.replay --cam sessions/sim/camera.jsonl --imu sessions/sim/imu.csv --loops 3
 ```
+
+
+
+## Completed swings and tracking quality (November 2026)
+
+The raw SVO and IMU CSV remain the complete recording. Analysis retains the stance for
+calibration, then stops at the IMU-detected swing end. A sustained 100 ms low-rate period
+ends an event; return-to-stance movement during the 1.5 s cooldown is ignored instead of
+being merged into the finished swing. `swing.max_duration_s` bounds an active event (default
+1.2 s); adjust it for deliberately slow drills. This is not a ball-contact trigger.
+
+Translation smoothing restarts across optical gaps longer than `swing.max_camera_gap_s`
+(default 60 ms), so reacquisition cannot pull an earlier segment through the backward pass.
+Speed samples inside those gaps and within `swing.reacquire_guard_s` (40 ms) of the edges
+are excluded. The replay hides unsupported poses and breaks the path and speed curve at
+those times. It stops at swing end and no longer displays the post-swing hold, coaching
+panel, extra metrics, or fitted plane.
+
+`fused.csv` retains raw model estimates with `speed_valid` and `in_swing` columns;
+`markers.csv` has `pose_supported`. Marker exports use `source: unsupported` for missing
+camera observations with no reliable optical support, rather than calling them validated
+IMU fills. `swing.json` includes `speed_reliable`, `speed_note`, and
+`speed_valid_fraction`. If optical support is missing near the wrist peak or selected
+contact, speed/related angles are unavailable (`null` in JSON), not a capped or guessed
+number. Supported results are still model estimates, not a speed accuracy guarantee.
+
+A wrist sensor cannot directly measure bat orientation during an arbitrary wrist hinge.
+Check calibration and synchronization diagnostics and compare against recorded video or
+an independent speed reference. Do not tune a speed cap to obtain a desired mph value.
+
+Reprocess an existing launcher session with `python3 run_schema.py --session sessions/schema_...`.
+Each attempt gets a new analysis directory; old results and raw recordings are kept.
+For a new swing use the same capture command and measured config as before. The camera's
+new default saturation threshold is 120 (the right camera's pink tape was being fragmented
+at 150); existing saved camera configs override that default.
