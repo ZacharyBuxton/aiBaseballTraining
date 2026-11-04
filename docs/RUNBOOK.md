@@ -111,8 +111,8 @@ being merged into the finished swing. `swing.max_duration_s` bounds an active ev
 Translation smoothing restarts across optical gaps longer than `swing.max_camera_gap_s`
 (default 60 ms), so reacquisition cannot pull an earlier segment through the backward pass.
 Speed samples inside those gaps and within `swing.reacquire_guard_s` (40 ms) of the edges
-are excluded. The replay hides unsupported poses and breaks the path and speed curve at
-those times. It stops at swing end and no longer displays the post-swing hold, coaching
+are excluded. The replay draws unsupported poses as orange IMU/model estimates and breaks
+the trusted speed curve at those times. It stops at swing end and no longer displays the post-swing hold, coaching
 panel, extra metrics, or fitted plane.
 
 `fused.csv` retains raw model estimates with `speed_valid` and `in_swing` columns;
@@ -132,3 +132,29 @@ Each attempt gets a new analysis directory; old results and raw recordings are k
 For a new swing use the same capture command and measured config as before. The camera's
 new default saturation threshold is 120 (the right camera's pink tape was being fragmented
 at 150); existing saved camera configs override that default.
+
+### Continuous IMU-assisted replay
+
+After successful camera/IMU calibration, replay keeps a pose at every available IMU sample
+through swing end. Pink shows camera-supported fusion. Orange dashed bat/path sections show
+estimated motion while the camera is hidden. The fused gyro supplies bat-axis prediction;
+gravity/lever-arm-corrected wrist acceleration supplies translation prediction. For gaps
+with camera support on both sides, a smooth cubic endpoint correction constrains predicted
+position and velocity to the next supported segment. This uses future observations offline.
+Unbounded edges dead-reckon from the nearest supported pose; unusable acceleration coasts.
+The interpolation/rigid-grip assumptions and wrist-to-bat flex remain limitations, particularly
+for long occlusions. No camera frames or missing IMU measurements are recovered by this step.
+
+`replay.csv` saves this continuous display trajectory, all configured marker positions,
+`pose_source` (`camera_supported_fusion` or `imu_estimate`), `nearest_camera_support_s`,
+`imu_accel_used`, `speed_valid`, and `in_swing`. Its timestamps are the received IMU times,
+not invented camera frame times. `swing.json` includes a replay estimate count and method.
+The conservative `fused.csv`, marker exports, and headline metrics retain their support flags;
+filling a display gap does not validate a speed. Long gaps may still make speed unavailable.
+If there is no supported camera anchor, the continuous replay cannot be established.
+
+For an end-on view, an end-cap patch can provide a visible point but cannot determine the bat
+axis alone. The current three-band tracker selects three pink blobs; do not add a fourth
+pink spot and assume it has an end-cap identity. A cap needs a separately configured/detected
+marker identity (preferably a distinct color) before it can be used without band ambiguity.
+Keep the measured band centers and black separators unchanged.
