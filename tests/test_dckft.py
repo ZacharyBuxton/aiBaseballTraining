@@ -190,6 +190,7 @@ def test_no_swing_raises(sim_session, tmp_path):
     _, paths = sim_session
     imu = load_imu_csv(paths["imu"])
     imu.gyro[:] *= 0.05
+    imu.accel[:] = imu.accel / np.linalg.norm(imu.accel, axis=1, keepdims=True) * 9.80665
     with pytest.raises(NoSwingError):
         process_swing(load_camera_jsonl(paths["camera"]), imu)
 
