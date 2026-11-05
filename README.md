@@ -76,6 +76,15 @@ Wrist IMU (ICM45686 + ADXL375) ─900 MHz─> USB ──>      │      → traj
 Both specs pass on simulated swings: <5 % tracking error and <5 s render latency. Live replay from swing end to
 render took ~1.8 s. Real-rig numbers still need to be measured (see `docs/FINAL_PLAN.md`).
 
+## Always-on capture (Nov 2026)
+
+`python3 run_stream.py` streams the camera and the IMU continuously. The IMU's acceleration triggers each swing
+(tune it with `python3 -m dckft.trigger_tune`), and holding the finish still marks the end of the swing.
+
+Attack angle and vertical bat angle are the headline outputs, using Blast Motion's definitions. Each is reported from
+the fusion and from the camera alone, with a camera quaternion built from the pink centroids. Setup and details are in
+`docs/RUNBOOK.md`, under "Always-on capture".
+
 ## Quick start
 
 ```bash
