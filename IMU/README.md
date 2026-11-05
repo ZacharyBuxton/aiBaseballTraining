@@ -23,6 +23,16 @@ python -m dckft.imu.reader --replay reports/ICM45686_and_ADXL375_test_data_2026-
 - **Same CSV columns** as before, plus `ts_ns_host`. Old CSVs still load; fusion then relies on
   cross-correlation alone.
 
+## November 2026 (advisor)
+
+- **Sensor:** only the **ICM45686** is used; the ADXL375 is ignored by default (`imu.use_adxl375`).
+  Impact is detected from the ICM45686 accelerometer.
+- **Mounting:** **bottom hand, wire side up.**
+- **Trigger:** the swing trigger is the IMU's **acceleration**: |a|−g by default, or one axis (likely −y with this
+  mounting). Pick it with `python -m dckft.trigger_tune --record 30`.
+- **New firmware:** add its frame layout to `FORMATS` in `dckft/imu/frames.py` and set `imu.frame_format`. A 64-bit
+  timestamp is handled; there is no wrap.
+
 ## Contents
 
 - **`reports/`:** a sample capture from 2026-09-30 (bench, then hand motion).
