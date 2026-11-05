@@ -24,8 +24,8 @@ class Coach(Protocol):
 
 RANGES = {
     "bat_speed_mph": (65.0, 80.0),
-    "attack_angle_deg": (5.0, 20.0),
-    "vertical_bat_angle_deg": (-45.0, -15.0),
+    "attack_angle_deg": (6.0, 14.0),             # Blast target range
+    "vertical_bat_angle_deg": (-33.0, -23.0),    # Blast college range
     "time_to_contact_s": (0.13, 0.20),
 }
 
@@ -46,7 +46,7 @@ class RuleBasedCoach:
                            "work up through the zone: match the pitch plane instead of chopping.")
             elif m.attack_angle_deg < lo:
                 out.append(f"Attack angle {m.attack_angle_deg:+.0f}° is a bit flat. A slightly more "
-                           "upward path (5–20°) keeps the barrel in the zone longer.")
+                           "upward path (+6 to +14°, Blast's target) keeps the barrel in the zone longer.")
             elif m.attack_angle_deg > hi + 5:
                 out.append(f"Attack angle {m.attack_angle_deg:+.0f}° is very uphill, so expect pop-ups. "
                            "Stay through the ball rather than lifting early.")

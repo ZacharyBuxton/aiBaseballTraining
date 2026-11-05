@@ -194,7 +194,8 @@ def simulate(params: SimParams = SimParams(), cfg: FusionConfig = FusionConfig()
                          "ts_ns_wall": ts + 3_000_000, "depth_source": "sim", "points": pts})
 
     # ---------------------------------------------------------------- truth
-    truth_swings = detect_swings(t_dev, gyro, hg if P.contact else np.zeros_like(hg), cfg.swing)
+    truth_swings = detect_swings(t_dev, gyro, hg if P.contact else np.zeros_like(hg), cfg.swing,
+                                 acc, cfg.swing.contact_hg_ms2)
     sw = truth_swings[-1]
     sw.t_contact = t_c_true if P.contact else None
     traj = Trajectory(t=t, knob=knob, knob_vel=vel_k, axis=u, axis_rate=vel_u)

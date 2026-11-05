@@ -8,6 +8,10 @@ run.py -- the one entry point for the DC-KFT pipeline.
   python -m dckft.run capture --port /dev/ttyUSB0          # Ctrl+C when done
   python -m dckft.run postprocess --session sessions/capture_20261105_141500
 
+  # Always-on (advisor, Nov 5): stream camera + IMU continuously, IMU acceleration triggers each swing
+  python -m dckft.run --config dckft_config.json stream --port /dev/ttyUSB0
+  # (python3 run_stream.py does the same with run_schema's measured config)
+
   # Live on the Jetson (start track_bat.py and dckft.imu.reader first; see docs/RUNBOOK.md)
   python -m dckft.run live --session-dir sessions
 
@@ -36,7 +40,7 @@ from .config import FusionConfig, load_config
 from .data import (CameraData, imu_from_samples, load_camera_jsonl, load_imu_csv,
                    payloads_to_camera, gravity_from_meta)
 from .pipeline import NoSwingError, process_swing
-from .swing import LiveSwingDetector, detect_swings
+from .swing import LiveSwingDetector, detect_swings, detect_swings_imu, impact_source
 
 
 def _print_summary(res, out_dir=None):
@@ -47,8 +51,12 @@ def _print_summary(res, out_dir=None):
     print(f"  estimated hand speed   {number(m.peak_hand_speed_mph)} mph")
     if not m.speed_reliable:
         print(f"  [tracking quality] {m.speed_note}")
-    print(f"  attack angle   {m.attack_angle_deg:+6.1f} deg")
-    print(f"  vertical bat   {m.vertical_bat_angle_deg:+6.1f} deg")
+    ang = lambda v: f"{v:+.1f} deg" if np.isfinite(v) else "unavailable (no camera pose at contact)"
+    cam = lambda v: f"{v:+.1f}" if np.isfinite(v) else "n/a"
+    print(f"  ATTACK ANGLE         {ang(m.attack_angle_deg):>12s}   camera-only {cam(m.attack_angle_cam_deg)}"
+          f"   (Blast target +6 to +14)")
+    print(f"  VERTICAL BAT ANGLE   {ang(m.vertical_bat_angle_deg):>12s}   camera-only "
+          f"{cam(m.vertical_bat_angle_cam_deg)}   (Blast college -23 to -33)")
     print(f"  time to contact {m.time_to_contact_s * 1e3:5.0f} ms   "
           f"{'(impact detected)' if m.contact_detected else '(dry swing)'}")
     for n in res.notes:
@@ -63,7 +71,7 @@ def _print_summary(res, out_dir=None):
 def cmd_process(a, cfg: FusionConfig) -> int:
     cam = load_camera_jsonl(a.cam, list(cfg.bat.marker_s_m))
     imu = load_imu_csv(a.imu)
-    swings = detect_swings(imu.t, imu.gyro, imu.accel_hg, cfg.swing)
+    swings = detect_swings_imu(imu, cfg)
     if not swings:
         print("No swings found in the IMU data.")
         return 1
@@ -232,23 +240,38 @@ def cmd_postprocess(a, cfg: FusionConfig) -> int:
 
 
 def cmd_live(a, cfg: FusionConfig) -> int:
+    """
+    Always-on consumer: camera payloads (track_bat.py, live pink detection) and IMU samples
+    (dckft.imu.reader) stream in continuously and sit in rolling FIFO buffers. The IMU trigger
+    (swing.trigger_source) marks a swing; once the bat is held still at the finish and the
+    camera has caught up, the window around it is fused and rendered. Nothing is clipped to a
+    fixed-length video: the streams never stop between swings.
+    """
     import zmq
+    from .data import gravity_from_meta
     ctx = zmq.Context.instance()
     cam_sock = ctx.socket(zmq.PULL); cam_sock.connect(a.camera_zmq or cfg.camera_zmq)
     imu_sock = ctx.socket(zmq.PULL); imu_sock.connect(a.imu_zmq or cfg.imu_zmq)
     poller = zmq.Poller()
     poller.register(cam_sock, zmq.POLLIN); poller.register(imu_sock, zmq.POLLIN)
 
-    session = os.path.join(a.session_dir, time.strftime("session_%Y%m%d_%H%M%S"))
-    rec = _Recorder(session)
+    session = getattr(a, "session_path", None) or os.path.join(
+        a.session_dir, time.strftime("session_%Y%m%d_%H%M%S"))
+    os.makedirs(session, exist_ok=True)
+    rec = None if getattr(a, "no_record", False) else _Recorder(session)
     print(f"Live: camera <- {a.camera_zmq or cfg.camera_zmq}, IMU <- {a.imu_zmq or cfg.imu_zmq}")
-    print(f"Recording raw data to {session}. Swing when ready; Ctrl+C to quit.")
+    print(f"Session: {session}")
+    print(f"Trigger: {cfg.swing.trigger_source} > "
+          f"{cfg.swing.trigger_rads if cfg.swing.trigger_source == 'gyro' else cfg.swing.trigger_accel_ms2}"
+          f" {'rad/s' if cfg.swing.trigger_source == 'gyro' else 'm/s^2'}. Hold the stance ~1 s, "
+          "swing, HOLD THE FINISH still. Ctrl+C to quit.")
 
-    # FIFO buffers (~12 s) -- the queues that interleave/align the two streams
-    cam_buf = deque(maxlen=120 * 12)
-    imu_buf = deque(maxlen=400 * 12)
+    buf_s = max(12.0, cfg.swing.pre_roll_s + cfg.swing.max_duration_s + 4.0)
+    cam_buf = deque(maxlen=int(150 * buf_s))
+    imu_buf = deque(maxlen=int(cfg.imu.nominal_rate_hz * 1.25 * buf_s))
     det = LiveSwingDetector(cfg.swing)
     gravity = None
+    meta_path = getattr(a, "camera_meta", None)
     show = not a.no_show
     if show:
         import matplotlib.pyplot as plt
@@ -256,6 +279,8 @@ def cmd_live(a, cfg: FusionConfig) -> int:
     last_check = 0.0
     n_swings = 0
     last_status = time.time()
+    pending = []                     # [(swing, w0, w1, t_triggered)] waiting for camera frames
+    look_s = cfg.swing.pre_roll_s + cfg.swing.max_duration_s + 2.0
     try:
         while True:
             events = dict(poller.poll(20))
@@ -265,7 +290,8 @@ def cmd_live(a, cfg: FusionConfig) -> int:
                         msg = cam_sock.recv_string(zmq.NOBLOCK)
                     except zmq.Again:
                         break
-                    rec.camera(msg)
+                    if rec:
+                        rec.camera(msg)
                     cam_buf.append(json.loads(msg))
             if imu_sock in events:
                 while True:
@@ -273,35 +299,59 @@ def cmd_live(a, cfg: FusionConfig) -> int:
                         msg = imu_sock.recv_string(zmq.NOBLOCK)
                     except zmq.Again:
                         break
-                    for s in json.loads(msg).get("samples", []):
-                        rec.imu_sample(s)
-                        imu_buf.append(s)
+                    for smp in json.loads(msg).get("samples", []):
+                        if rec:
+                            rec.imu_sample(smp)
+                        imu_buf.append(smp)
+            if gravity is None and meta_path and os.path.exists(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        gravity = gravity_from_meta(json.load(f))
+                    if gravity is not None:
+                        print(f"\n[live] camera gravity from ZED IMU: {np.round(gravity, 2)}")
+                except (OSError, ValueError):
+                    pass
 
             now = time.time()
             if now - last_status > 2.0:
                 last_status = now
-                print(f"\r  buffers: camera {len(cam_buf):5d}  imu {len(imu_buf):5d}  swings {n_swings}",
-                      end="", flush=True)
-            if now - last_check < 0.05 or len(imu_buf) < 400:
-                if show:
-                    plt.pause(0.001)
+                print(f"\r  buffers: camera {len(cam_buf):5d}  imu {len(imu_buf):5d}  "
+                      f"swings {n_swings}  waiting {len(pending)}", end="", flush=True)
+            if show:
+                plt.pause(0.001)
+            if now - last_check < 0.05 or len(imu_buf) < 200:
                 continue
             last_check = now
-            recent = list(imu_buf)[-400 * 4:]
-            imu = imu_from_samples(recent)
-            sw = det.update(now, imu.t, imu.gyro, imu.accel_hg)
-            if sw is None:
+
+            # 1) trigger on the IMU (most recent few seconds only)
+            n_recent = int(cfg.imu.nominal_rate_hz * look_s)
+            imu = imu_from_samples(list(imu_buf)[-n_recent:])
+            sig, thr = impact_source(imu, cfg)
+            sw = det.update(now, imu.t, imu.gyro, sig, imu.accel, thr)
+            if sw is not None:
+                print(f"\n[trigger] swing at {time.strftime('%H:%M:%S', time.localtime(sw.t_onset))}"
+                      f" ({sw.t_end - sw.t_onset:.2f} s, finish held)")
+                pending.append((sw, sw.t_onset - cfg.swing.pre_roll_s - 0.3,
+                                sw.t_end + cfg.swing.post_roll_s + 0.3, now))
+
+            # 2) process a pending swing once the camera has caught up (or after 1.5 s)
+            if not pending:
                 continue
+            sw, w0, w1, t_trig = pending[0]
+            cam_latest = cam_buf[-1]["ts_ns_image"] * 1e-9 if cam_buf else -1e18
+            if cam_latest < w1 and now - t_trig < 1.5:
+                continue
+            pending.pop(0)
             t_detect = time.perf_counter()
-            w0 = sw.t_onset - cfg.swing.pre_roll_s - 0.3
-            w1 = sw.t_end + cfg.swing.post_roll_s + 0.3
-            imu_w = imu.slice(w0, w1)
+            imu_all = imu_from_samples(list(imu_buf))
+            imu_w = imu_all.slice(w0, w1)
             cams = [p for p in cam_buf if w0 - 0.3 <= p["ts_ns_image"] * 1e-9 <= w1 + 0.3]
             if len(cams) < 10:
-                print(f"\n[live] swing detected but only {len(cams)} camera frames in the window -- "
-                      "is track_bat.py running and publishing?")
+                print(f"\n[live] swing triggered but only {len(cams)} camera frames in its window -- "
+                      "is the camera publishing and seeing the pink bands?")
                 continue
             cam = payloads_to_camera(cams, list(cfg.bat.marker_s_m))
+            cam.gravity_cam = gravity
             try:
                 res = process_swing(cam, imu_w, cfg)
             except Exception as e:      # keep the session alive on a bad swing
@@ -324,8 +374,69 @@ def cmd_live(a, cfg: FusionConfig) -> int:
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
-        rec.close()
+        if rec:
+            rec.close()
     return 0
+
+
+def cmd_stream(a, cfg: FusionConfig) -> int:
+    """
+    One command for always-on capture: starts the camera tracker (live pink detection,
+    continuous JSONL), the IMU reader (continuous CSV), and the live consumer (IMU trigger ->
+    fuse -> render). Every frame and every IMU sample of the session is kept on disk, so any
+    swing can be re-run later with `dckft.run process --cam ... --imu ... --all`.
+    """
+    import signal
+    import subprocess
+
+    session = os.path.abspath(os.path.join(a.session_dir, time.strftime("stream_%Y%m%d_%H%M%S")))
+    os.makedirs(session, exist_ok=True)
+    py = sys.executable
+    cam_jsonl = os.path.join(session, "camera.jsonl")
+    cam_cmd = [py, "-u", os.path.join(REPO_ROOT, "Cameras", "track_bat.py"), "--jsonl", cam_jsonl,
+               "--quiet", "--zmq-bind", "tcp://*:5557"]
+    if a.cam_config:
+        cam_cmd += ["--config", a.cam_config]
+    if a.config:
+        cam_cmd += ["--bat-config", a.config]
+    imu_cmd = [py, "-u", "-m", "dckft.imu.reader", "--csv", os.path.join(session, "imu.csv"),
+               "--zmq-bind", "tcp://*:5558", "--quiet"]
+    if a.port:
+        imu_cmd += ["--port", a.port]
+    if a.config:
+        imu_cmd += ["--config", a.config]
+    logs, procs = [], []
+    for name, cmd in (("imu", imu_cmd), ("camera", cam_cmd)):
+        log = open(os.path.join(session, name + ".log"), "w")
+        logs.append(log)
+        procs.append((name, subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT,
+                                             start_new_session=True)))
+    print(f"Started IMU reader and camera tracker (logs in {session}).")
+    a.session_path, a.no_record = session, True
+    a.camera_meta = cam_jsonl + ".meta.json"
+    a.camera_zmq = a.imu_zmq = None
+    rc = 0
+    try:
+        time.sleep(2.0)
+        dead = [n for n, p in procs if p.poll() is not None]
+        if dead:
+            print(f"[stream] {', '.join(dead)} exited at startup -- see its .log in {session}")
+            rc = 1
+        else:
+            rc = cmd_live(a, cfg)
+    finally:
+        for _, p in procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGINT)
+        for n, p in procs:
+            try:
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.terminate()
+        for log in logs:
+            log.close()
+    print(f"Session kept: {session}  (camera.jsonl, imu.csv, swing_NN/)")
+    return rc
 
 
 def main(argv=None) -> int:
@@ -364,7 +475,12 @@ def main(argv=None) -> int:
     pp.add_argument("--cam-config", help="Cameras/ JSON config used for marker detection")
     pp.add_argument("--redetect", action="store_true", help="re-run marker detection on the SVO")
 
-    for q in (p, s, lv, cp, pp):
+    st = sub.add_parser("stream", help="always-on: camera + IMU stream, IMU-triggered swings")
+    st.add_argument("--session-dir", default="sessions")
+    st.add_argument("--port", help="IMU radio serial port (default: auto)")
+    st.add_argument("--cam-config", help="Cameras/ JSON config (pink hue, exposure, fps)")
+
+    for q in (p, s, lv, cp, pp, st):
         q.add_argument("--no-show", action="store_true", help="don't open a window (still saves PNG)")
         q.add_argument("--no-render", action="store_true", help="skip rendering entirely")
         q.add_argument("--mp4", action="store_true", help="also save swing.mp4 (needs ffmpeg)")
@@ -382,7 +498,7 @@ def main(argv=None) -> int:
         return 0
     try:
         return {"process": cmd_process, "simulate": cmd_simulate, "validate": cmd_validate,
-                "live": cmd_live, "capture": cmd_capture,
+                "live": cmd_live, "capture": cmd_capture, "stream": cmd_stream,
                 "postprocess": cmd_postprocess}[a.cmd](a, cfg)
     except NoSwingError as e:
         print(f"[dckft] {e}")

@@ -8,6 +8,8 @@ All angles use `up` = -gravity in the camera/world frame.
   peak_hand_speed_mph     max speed of the hands point (BatConfig.hands_s_m)
   attack_angle_deg        sweet-spot velocity direction vs horizontal at contact (+ = upward)
   vertical_bat_angle_deg  bat axis (knob -> tip) vs horizontal at contact (- = barrel below hands)
+                          (both as Blast Motion defines them; ranges in BLAST_REFERENCE)
+  *_cam_deg               the same two angles from the camera alone (pink centroids), a cross-check
   time_to_contact_s       swing onset -> contact
   swing_plane_tilt_deg    tilt from horizontal of the plane best fitting the sweet-spot path
   peak_wrist_rate_dps     peak wrist angular rate (IMU)
@@ -28,6 +30,22 @@ from .trajectory import Trajectory
 
 MPS_TO_MPH = 2.2369362920544
 
+# Blast Motion's definitions and typical ranges (blastmotion.com, "What is attack angle" May 2026,
+# "What is vertical bat angle" Jul 2026; Blast metric reference v4.7):
+#   Attack angle: angle of the bat's PATH at impact relative to horizontal; + = swinging up.
+#   Vertical bat angle: angle of the BAT (knob -> barrel) relative to horizontal at impact;
+#     negative when the barrel is below the knob.
+#   Bat speed: sweet spot, 6 in from the tip, at impact.  Peak hand speed: 6 in from the knob.
+BLAST_REFERENCE = {
+    "attack_angle_deg": {"target": [6, 14], "by_level": {
+        "Professional": [2, 16], "MiLB": [1, 15], "College": [0, 14],
+        "High School": [0, 14], "Youth": [0, 14]}},
+    "vertical_bat_angle_deg": {"by_level": {
+        "Professional": [-35, -25], "MiLB": [-34, -24], "College": [-33, -23],
+        "HS Varsity": [-31, -21], "HS JV": [-30, -20], "Middle School": [-27, -17],
+        "Youth": [-25, -15]}},
+}
+
 
 @dataclass
 class SwingMetrics:
@@ -46,6 +64,11 @@ class SwingMetrics:
     speed_reliable: bool = True
     speed_note: str = ""
     speed_valid_fraction: float = 1.0
+    # Angles are judged on their own: they need the bat POSE seen at contact, not the speed
+    # peak (advisor: attack angle and vertical bat angle are the end-of-project goal).
+    angles_reliable: bool = True
+    attack_angle_cam_deg: float = float("nan")
+    vertical_bat_angle_cam_deg: float = float("nan")
 
     def to_dict(self) -> dict:
         return {k: ((round(v, 4) if np.isfinite(v) else None) if isinstance(v, float) else v)
@@ -112,12 +135,17 @@ def compute_metrics(traj: Trajectory, omega_world: np.ndarray, swing: Swing, bat
         peak_acc = float("nan")
 
     wrist = np.linalg.norm(omega_world, axis=1)
+    # Angles: the pose at contact must be optically supported, and for the attack angle (a
+    # direction of motion) a few supported samples must sit around contact.
+    near = (t >= t[k_c_pre] - 0.02) & (t <= t[k_c_pre] + 0.02)
+    angles_ok = bool(valid[k_c_pre]) and int((near & valid).sum()) >= 3
     return SwingMetrics(
         bat_speed_mph=float(ss_speed[k_c_pre] * MPS_TO_MPH) if reliable else float("nan"),
         peak_bat_speed_mph=float(ss_speed[pre].max() * MPS_TO_MPH) if reliable else float("nan"),
         peak_hand_speed_mph=float(hands_speed[pre].max() * MPS_TO_MPH) if reliable else float("nan"),
-        attack_angle_deg=_angle_to_horizontal(v_ss[k_c_pre], up) if reliable else float("nan"),
-        vertical_bat_angle_deg=_angle_to_horizontal(traj.axis[k_c_pre], up) if reliable else float("nan"),
+        attack_angle_deg=_angle_to_horizontal(v_ss[k_c_pre], up) if angles_ok else float("nan"),
+        vertical_bat_angle_deg=(_angle_to_horizontal(traj.axis[k_c_pre], up) if valid[k_c_pre]
+                                else float("nan")),
         time_to_contact_s=float(t_contact - swing.t_onset),
         swing_plane_tilt_deg=tilt,
         peak_wrist_rate_dps=float(np.degrees(wrist[pre].max())) if pre.any() else float("nan"),
@@ -128,5 +156,6 @@ def compute_metrics(traj: Trajectory, omega_world: np.ndarray, swing: Swing, bat
         speed_reliable=reliable,
         speed_note=note,
         speed_valid_fraction=fraction,
+        angles_reliable=angles_ok,
     )
 

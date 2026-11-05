@@ -64,7 +64,9 @@ def replay(cam_path: str, imu_path: str, cam_bind="tcp://*:5557", imu_bind="tcp:
                     pass
             else:
                 r = rows[i]
-                batch.append({"tx_us": int(r["tx_time_stamp"]), "ts_ns_host": now_stamp,
+                # keep the device clock counting across loops, as a real IMU's does
+                tx = int(r["tx_time_stamp"]) + loop * int((events[-1][0] + gap_s * 1e9) / 1e3)
+                batch.append({"tx_us": tx & 0xFFFFFFFF, "ts_ns_host": now_stamp,
                               "accel": [r["accel_x"], r["accel_y"], r["accel_z"]],
                               "gyro": [r["omega_x"], r["omega_y"], r["omega_z"]],
                               "accel_hg": [r["accel_x2"], r["accel_y2"], r["accel_z2"]],

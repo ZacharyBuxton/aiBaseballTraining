@@ -34,7 +34,7 @@ class BatConfig:
     })
     length_m: float = 0.838            # 33 in
     sweet_spot_s_m: float = 0.686      # ~6 in from the end cap
-    hands_s_m: float = 0.08            # where the hands sit (top hand), from the knob
+    hands_s_m: float = 0.152           # hand-speed point: 6 in from the knob, as Blast measures it
     imu_s_m: float = 0.05              # wrist IMU position along the handle, from the knob (approx.)
 
 
@@ -42,7 +42,8 @@ class BatConfig:
 class ImuConfig:
     port: Optional[str] = None          # None = auto-detect /dev/ttyUSB* / ttyACM* / COMx
     baud: int = 921600
-    frame_size: int = 30
+    frame_format: str = "v1"            # dckft/imu/frames.py FORMATS; add the new firmware there
+    frame_size: int = 30                # informational; the format defines the real size
     sync_word: int = 4095               # status word in the last 2 bytes of every valid frame
     zmq_bind: Optional[str] = "tcp://*:5558"
     nominal_rate_hz: float = 400.0
@@ -53,9 +54,12 @@ class ImuConfig:
     gyro_saturation_rads: float = 69.0
     accel_saturation_ms2: float = 300.0
     hg_saturation_ms2: float = 1900.0   # ADXL375 +-200 g
-    # Swap in the ADXL375 where the ICM45686 accelerometer clips. Assumes the legacy axis mapping
-    # puts both sensors in the same frame -- check once on the bench (dckft.imu.reader --csv, tilt
-    # the board, compare accel_* with accel_*2) before relying on it.
+    # ICM45686 ONLY (advisor, Nov 5): the ADXL375 channels are still decoded and logged when the
+    # frame carries them, but nothing uses them unless use_adxl375 is turned back on. Impact
+    # detection then runs on the ICM45686 accelerometer (see swing.contact_icm_ms2).
+    use_adxl375: bool = False
+    # Only with use_adxl375: swap in the ADXL375 where the ICM45686 accelerometer clips. Assumes
+    # both sensors share a frame -- check on the bench first (tilt, compare accel_* vs accel_*2).
     use_highg_when_saturated: bool = True
 
 
@@ -85,14 +89,21 @@ class EkfConfig:
 
 @dataclass
 class SwingConfig:
+    # IMU trigger (advisor, Nov 5): acceleration. accel_mag | accel_xy | accel_-y (wire side up,
+    # bottom hand) | accel_+x ... | gyro. Tune with: python -m dckft.trigger_tune --csv imu.csv
+    trigger_source: str = "accel_mag"
+    trigger_accel_ms2: float = 30.0     # ~3 g beyond gravity; real swings reach 10-30 g at the hand
     onset_rads: float = 4.0             # |omega| crossing that marks swing start (searching back)
-    trigger_rads: float = 10.0          # |omega| that confirms a swing (~570 dps; real swings 1500+ dps)
+    trigger_rads: float = 10.0          # used when trigger_source == "gyro" (~570 dps)
     end_rads: float = 4.0
     min_gap_s: float = 1.5
     pre_roll_s: float = 1.0             # data kept before onset (stance -> calibration)
     post_roll_s: float = 0.4
     contact_hg_ms2: float = 300.0       # ADXL375 spike threshold for ball contact (~30 g)
-    end_hold_s: float = 0.10           # finish after sustained low wrist rate
+    contact_icm_ms2: float = 120.0      # ICM45686 spike threshold (it clips at +-32 g = 313 m/s^2)
+    end_hold_s: float = 0.10           # finish after sustained low wrist rate (hold the finish)
+    end_requires_still_accel: bool = True   # ...and |a| within still_accel_ms2 of 1 g
+    still_accel_ms2: float = 3.0
     max_duration_s: float = 1.2        # bound one swing; reset movement starts a new event
     max_camera_gap_s: float = 0.06     # longer optical gaps are NOT reliable speed samples
     reacquire_guard_s: float = 0.04    # exclude both edges of a long gap from speed metrics
