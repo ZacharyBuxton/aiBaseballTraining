@@ -30,7 +30,16 @@
 | 13 | Per-marker gap filling from the IMU (`markers.py`, outputs tagged camera / imu_fill) | ✅ done (Oct 22) |
 | 14 | Record-then-process: `dckft.run capture` / `postprocess`, `track_bat.py --record-only` | ✅ done, needs a Jetson run |
 | 15 | Kalman RTS backward smoother; per-marker knob fixes; ADXL375 when the ICM clips | ✅ done (Oct 22) |
+| 17 | Advisor Nov 5: ICM45686-only IMU, pluggable IMU frame format, acceleration trigger + held finish, always-on `run_stream.py`, camera quaternion from pink centroids, attack angle / vertical bat angle (Blast definitions) with camera cross-check | ✅ done (Nov 5), needs rig test |
 | 16 | Neon-pink-only tracking: multi-band and stripe detection, same-color stereo matching, band labeler | ✅ done (Nov 3), needs a real-tape check |
+
+## End-of-project goal (advisor)
+
+Reliable **attack angle** and **vertical bat angle** at contact, comparable to Blast Motion:
+- **Attack angle:** Blast's target is +6 to +14°.
+- **Vertical bat angle:** Blast's college range is −23 to −33°.
+
+Check both against video, or against a Blast sensor if one is available.
 
 ## Remaining work, all on the real rig (in order)
 

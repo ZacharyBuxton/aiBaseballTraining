@@ -170,3 +170,80 @@ axis alone. The current three-band tracker selects three pink blobs; do not add 
 pink spot and assume it has an end-cap identity. A cap needs a separately configured/detected
 marker identity (preferably a distinct color) before it can be used without band ambiguity.
 Keep the measured band centers and black separators unchanged.
+
+## Always-on capture with an IMU trigger (advisor meeting, Nov 5)
+
+The goal is to always be recording instead of taking fixed clips. The camera and the IMU stream continuously, and the
+IMU marks each swing.
+
+### Setup
+
+- **IMU:** on the **bottom hand**, **wire side up**. Only the ICM45686 is used; the ADXL375 is ignored unless
+  `imu.use_adxl375` is set to true.
+- **Tape:** pink bands on the **top of the bat**.
+- **Camera:** level and **straight on** (not angled), about **8–10 ft (2.4–3 m)** from the hitter. Try a few
+  distances and keep the one with the best `seen_pct` in `swing.json`.
+- **Each swing:** hold the stance still for about 1 s, swing, then **hold the finish still**. The held finish is how
+  the software knows the swing ended.
+
+### 1. Pick the trigger (once per mount)
+
+```bash
+python3 -m dckft.trigger_tune --record 30 --port /dev/ttyUSB0
+```
+
+During the 30 s recording:
+- stand still
+- take 3–5 swings, holding each finish
+- waggle and walk around in between
+
+The tool compares |a|−g, |(a_x, a_y)|, each signed axis (−y is the advisor's guess) and the wrist rate. It then
+prints the best `swing.trigger_source` and `trigger_accel_ms2`. Put those in `run_schema_config.json`, in the
+`"swing"` section.
+
+### 2. Run
+
+```bash
+python3 run_stream.py --port /dev/ttyUSB0 --cam-config Cameras/cage.json
+```
+
+This starts three things:
+- the camera tracker, detecting pink live
+- the IMU reader
+- the live consumer
+
+Every frame and IMU sample is kept in `sessions/stream_*/` (`camera.jsonl`, `imu.csv`, plus `camera.log` and `imu.log`).
+
+When the trigger fires and the finish is held, the window around the swing is fused and shown in the same 3D render
+as `run_schema.py`. Outputs go to `swing_NN/`. Press Ctrl+C to stop.
+
+- **Orin Nano:** if the camera log warns that processing is slower than the frame period, set the camera to
+  60 fps in the camera config.
+- **Reprocess a session later:**
+
+```bash
+python3 -m dckft.run --config run_schema_config.json process \
+    --cam sessions/stream_X/camera.jsonl --imu sessions/stream_X/imu.csv --all
+```
+
+### What to read for each swing (the end-of-project goal)
+
+The terminal and `swing.json` lead with these, using Blast Motion's definitions:
+- **Attack angle:** the angle of the barrel's path at impact relative to horizontal; positive means swinging up.
+  Blast's target is +6 to +14°.
+- **Vertical bat angle:** the angle of the bat, knob to barrel, relative to horizontal at impact; negative means the
+  barrel is below the hands. Blast's college range is −23 to −33°.
+
+Both come from the fusion and, as a cross-check, from the camera alone (`*_cam_deg`).
+- **Camera-only orientation:** the camera-only value comes from a quaternion built from the pink centroids in each
+  frame. Its rate of change gives the bat's angular velocity (ω = 2 q̇ q*). That is saved in
+  `camera_orientation.csv` and compared with the IMU in `diagnostics.camera_quaternion_vs_imu`.
+- **Availability:** the angles are reported whenever the camera saw the bat pose at contact, even if the speed is
+  unavailable. Hand speed is measured 6 in from the knob, as Blast does.
+
+### New IMU firmware
+
+When the IMU's new firmware (with better timestamps) is ready, add its frame layout to `FORMATS` in
+`dckft/imu/frames.py`. There is a commented example: an ICM-only frame with a 64-bit µs timestamp. Then set
+`imu.frame_format` in the config. Nothing else changes. A 64-bit device timestamp never wraps, and it is mapped onto
+the Jetson clock the same way.
