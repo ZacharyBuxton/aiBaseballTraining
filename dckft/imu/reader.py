@@ -68,11 +68,12 @@ def autodetect_port() -> Optional[str]:
 class CsvSink:
     """Writes the legacy column set plus ts_ns_host (fuse/analysis code reads either)."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, cfg: Optional[ImuConfig] = None):
+        from .frames import frame_format
         self.f = open(path, "w", newline="")
         self.w = csv.writer(self.f)
         self.w.writerow(CSV_COLUMNS)
-        self.clock = TxClock()
+        self.clock = TxClock(frame_format(cfg or ImuConfig()).ts_bits)
         self.tx0 = None
         self.host0 = None
 
@@ -263,7 +264,7 @@ def main(argv=None) -> int:
 
     sinks = []
     if a.csv:
-        sinks.append(CsvSink(a.csv))
+        sinks.append(CsvSink(a.csv, cfg))
     if not a.no_zmq and cfg.zmq_bind:
         sinks.append(ZmqSink(cfg.zmq_bind))
     if not sinks:

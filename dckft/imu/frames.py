@@ -1,5 +1,7 @@
 """
-frames.py -- decode the IMU's 30-byte binary frames (ICM45686 + ADXL375 board).
+frames.py -- decode the IMU's binary frames. The layout is a FrameFormat (FORMATS below), so the
+new IMU firmware is a config change: imu.frame_format. "v1" = the current 30-byte frame
+(ICM45686 + ADXL375 board), documented here:
 
 Frame layout (big-endian), unchanged from the previous team's firmware and carried as-is
 over the 900 MHz radio link:
@@ -17,6 +19,7 @@ re-synchronises by scanning for the status word, so a dropped radio byte costs o
 
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 from typing import Iterator, List, Optional
@@ -25,9 +28,61 @@ import numpy as np
 
 from ..config import ImuConfig
 
-FRAME_SIZE = 30
-_STRUCT = struct.Struct(">I9h4H")
-assert _STRUCT.size == FRAME_SIZE
+@dataclass(frozen=True)
+class FrameFormat:
+    """
+    One firmware's binary frame layout. The decoder, parser and simulator are driven by this, so
+    the NEW IMU firmware only needs a new entry in FORMATS (and imu.frame_format in the config).
+
+      struct      big-endian struct string for the whole frame
+      sync_index  index (into the unpacked tuple) of the status/sync word; its 2 bytes are the
+                  LAST two bytes of the frame (what the resync scanner looks for)
+      ts_index    index of the device timestamp; ts_bits 32 (wraps) or 64 (no wrap);
+                  ts_unit_us = microseconds per timestamp tick
+      accel/gyro/hg/hf   ((index, sign), ...) per axis, before LSB scaling; hg/hf may be ()
+    """
+    name: str
+    struct: str
+    sync_index: int
+    ts_index: int
+    ts_bits: int
+    ts_unit_us: float
+    accel: tuple
+    gyro: tuple
+    hg: tuple = ()
+    hf: tuple = ()
+
+    @property
+    def size(self) -> int:
+        return struct.calcsize(self.struct)
+
+
+FORMATS = {
+    # Previous team's firmware, carried unchanged over the 900 MHz radio (Oct 2026):
+    #   uint32 tx_us | int16 ICM accel xyz | int16 ICM gyro xyz | int16 ADXL375 raw 0,1,2 |
+    #   uint16 hf1..3 | uint16 status (4095)
+    # Axis signs / ADXL swap copied from IMU/legacy/imu_data_collection.py.
+    "v1": FrameFormat(
+        name="v1", struct=">I9h4H", sync_index=13, ts_index=0, ts_bits=32, ts_unit_us=1.0,
+        accel=((1, -1), (2, 1), (3, -1)), gyro=((4, -1), (5, 1), (6, -1)),
+        hg=((8, 1), (7, -1), (9, 1)), hf=((10, 1), (11, 1), (12, 1))),
+    # NEW FIRMWARE: add its layout here once Charles / Dr. Jupina fix it, e.g. an ICM45686-only
+    # frame with a 64-bit microsecond timestamp (no 71-minute wrap, better host mapping):
+    #   "v2": FrameFormat(name="v2", struct=">Q6hH", sync_index=7, ts_index=0, ts_bits=64,
+    #                     ts_unit_us=1.0, accel=((1, -1), (2, 1), (3, -1)),
+    #                     gyro=((4, -1), (5, 1), (6, -1))),
+    # then set imu.frame_format = "v2" and imu.baud to match. Verify signs with a tilt test.
+}
+
+
+def frame_format(cfg: ImuConfig) -> FrameFormat:
+    try:
+        return FORMATS[cfg.frame_format]
+    except KeyError:
+        raise ValueError(f"Unknown imu.frame_format {cfg.frame_format!r}; known: {list(FORMATS)}")
+
+
+FRAME_SIZE = FORMATS["v1"].size          # kept for older callers
 
 CSV_COLUMNS = [
     "tx_time_stamp", "imu_meas_time", "system_time", "status_var_value",
@@ -55,38 +110,56 @@ class ImuSample:
         }
 
 
+def _axes(v, spec, lsb):
+    return np.array([sign * lsb * v[i] for i, sign in spec]) if spec else np.zeros(3)
+
+
 def decode_frame(frame: bytes, cfg: ImuConfig = ImuConfig(), ts_ns_host: int = 0) -> Optional[ImuSample]:
-    if len(frame) != FRAME_SIZE:
+    fmt = frame_format(cfg)
+    if len(frame) != fmt.size:
         return None
-    v = _STRUCT.unpack(frame)
-    if v[13] != cfg.sync_word:
+    v = struct.unpack(fmt.struct, frame)
+    if v[fmt.sync_index] != cfg.sync_word:
         return None
-    a, g, h = cfg.accel_lsb, cfg.gyro_lsb, cfg.hg_lsb
     return ImuSample(
-        tx_us=v[0],
-        accel=np.array([-a * v[1], a * v[2], -a * v[3]]),
-        gyro=np.array([-g * v[4], g * v[5], -g * v[6]]),
-        accel_hg=np.array([h * v[8], -h * v[7], h * v[9]]),
-        hf=np.array([h * v[10], h * v[11], h * v[12]]),
-        status=v[13],
+        tx_us=int(round(v[fmt.ts_index] * fmt.ts_unit_us)),
+        accel=_axes(v, fmt.accel, cfg.accel_lsb),
+        gyro=_axes(v, fmt.gyro, cfg.gyro_lsb),
+        accel_hg=_axes(v, fmt.hg, cfg.hg_lsb),
+        hf=_axes(v, fmt.hf, cfg.hg_lsb),
+        status=v[fmt.sync_index],
         ts_ns_host=ts_ns_host,
     )
 
 
 def encode_frame(tx_us: int, accel, gyro, accel_hg=(0, 0, 0), hf=(0, 0, 0),
                  cfg: ImuConfig = ImuConfig()) -> bytes:
-    """Inverse of decode_frame (used by the simulator and tests)."""
-    a, g, h = cfg.accel_lsb, cfg.gyro_lsb, cfg.hg_lsb
-    clip16 = lambda x: int(np.clip(round(x), -32768, 32767))
-    clipu = lambda x: int(np.clip(round(x), 0, 65535))
-    return _STRUCT.pack(
-        int(tx_us) & 0xFFFFFFFF,
-        clip16(-accel[0] / a), clip16(accel[1] / a), clip16(-accel[2] / a),
-        clip16(-gyro[0] / g), clip16(gyro[1] / g), clip16(-gyro[2] / g),
-        clip16(-accel_hg[1] / h), clip16(accel_hg[0] / h), clip16(accel_hg[2] / h),
-        clipu(hf[0] / h), clipu(hf[1] / h), clipu(hf[2] / h),
-        cfg.sync_word,
-    )
+    """Inverse of decode_frame for the configured format (simulator and tests)."""
+    fmt = frame_format(cfg)
+    codes = struct.Struct(fmt.struct)
+    n = len(codes.unpack(bytes(fmt.size)))
+    vals = [0] * n
+    expanded = []                                         # one struct code per value
+    for part in re.findall(r"(\d*)([a-zA-Z])", fmt.struct):
+        expanded += [part[1]] * (int(part[0]) if part[0] else 1)
+
+    def put(spec, xyz, lsb):
+        for (i, sign), x in zip(spec, xyz):
+            vals[i] = sign * x / lsb
+
+    put(fmt.accel, accel, cfg.accel_lsb)
+    put(fmt.gyro, gyro, cfg.gyro_lsb)
+    put(fmt.hg, accel_hg, cfg.hg_lsb)
+    put(fmt.hf, hf, cfg.hg_lsb)
+    vals[fmt.ts_index] = int(round(tx_us / fmt.ts_unit_us)) & ((1 << fmt.ts_bits) - 1)
+    vals[fmt.sync_index] = cfg.sync_word
+    lim = {"h": (-32768, 32767), "H": (0, 65535), "i": (-2**31, 2**31 - 1), "I": (0, 2**32 - 1),
+           "q": (-2**63, 2**63 - 1), "Q": (0, 2**64 - 1), "b": (-128, 127), "B": (0, 255)}
+    out = []
+    for code, x in zip(expanded, vals):
+        lo, hi = lim.get(code, (-2**63, 2**63 - 1))
+        out.append(int(np.clip(round(x), lo, hi)))
+    return codes.pack(*out)
 
 
 class FrameParser:
@@ -94,6 +167,7 @@ class FrameParser:
 
     def __init__(self, cfg: ImuConfig = ImuConfig()):
         self.cfg = cfg
+        self.n = frame_format(cfg).size
         self.buf = bytearray()
         self.sync = struct.pack(">H", cfg.sync_word)
         self.good = 0
@@ -101,7 +175,7 @@ class FrameParser:
         self.skipped_bytes = 0
 
     def _aligned(self, off: int) -> bool:
-        n = FRAME_SIZE
+        n = self.n
         if self.buf[off + n - 2: off + n] != self.sync:
             return False
         # If the next frame is already buffered, require it to line up too.
@@ -113,7 +187,7 @@ class FrameParser:
     def feed(self, data: bytes, ts_ns_host: int = 0) -> List[ImuSample]:
         self.buf.extend(data)
         out: List[ImuSample] = []
-        n = FRAME_SIZE
+        n = self.n
         while len(self.buf) >= n:
             if self.buf[n - 2:n] == self.sync:
                 s = decode_frame(bytes(self.buf[:n]), self.cfg, ts_ns_host)
@@ -145,13 +219,17 @@ def iter_frames(data: bytes, cfg: ImuConfig = ImuConfig()) -> Iterator[ImuSample
 
 
 class TxClock:
-    """Unwraps the device's uint32 microsecond counter into a monotonically increasing int."""
+    """Unwraps a wrapping device counter (32-bit by default) into a monotonically increasing int.
+    A 64-bit timestamp (new firmware) never wraps, so it passes through unchanged."""
 
-    def __init__(self):
+    def __init__(self, bits: int = 32):
         self.last = None
         self.wraps = 0
+        self.bits = bits
 
     def __call__(self, tx_us: int) -> int:
+        if self.bits >= 64:
+            return tx_us
         if self.last is not None and tx_us < self.last and (self.last - tx_us) > 2 ** 31:
             self.wraps += 1
         self.last = tx_us
