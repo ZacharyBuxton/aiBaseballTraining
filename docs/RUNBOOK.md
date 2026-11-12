@@ -2,6 +2,44 @@
 
 Everything runs on the Jetson. Run the commands from the repo root with the venv active.
 
+## Swing recorder app (Nov 12): the easy way
+
+```bash
+python3 run_app.py                     # on the Orin; add --port /dev/ttyUSB0 --cam-config Cameras/<file>.json if needed
+```
+
+Open `http://<orin-ip>:8000` in any browser on the same network (`hostname -I` prints the IP), or
+`http://localhost:8000` on the Orin. The page has four buttons:
+
+- **Start recording**: starts the IMU reader and the camera tracker. Every swing is caught by the ring buffer,
+  processed, rendered and added to the list on its own. Press **Stop** when done.
+- **Simulate swing**: runs one simulated swing through the same ring buffer and pipeline. Use it to test with no hardware.
+- **Update from GitHub**: runs `git pull` and restarts the app. The app also pulls once on start (`--no-pull` to skip).
+- Click any swing in the list to see its render, attack angle, vertical bat angle, bat speed and the raw files.
+
+Swings are stored in `app_data/swings/<id>/`, which git ignores. The app uses `run_schema_config.json`, the measured
+bat geometry written by `run_schema.py`, when that file exists.
+
+### Ring buffer trigger (from the advisor's Inertial_Sensors_Capture.py)
+
+`dckft/ring.py` keeps the last 1200 IMU frames (3 s at 400 Hz). When |ω| rises above 10 rad/s, it saves those 1200
+frames plus the next 1200, so each swing is a 6 s window. These rules match the example:
+
+- the pre-roll must be full before a trigger
+- the gyro must drop below the threshold once before the next trigger (no re-trigger while held high)
+- a gap longer than 3.75 ms resets the buffer, so frames are never stitched across a dropout
+- duplicate and out-of-order frames are ignored
+
+Settings are `swing.trigger_source`, `swing.trigger_rads`, `swing.ring_pre_frames`, `swing.ring_post_frames` and
+`swing.ring_max_dt_us`. `run_stream.py` and `python -m dckft.run live` use the same ring.
+
+### Protocol-v2 receiver frames (42 bytes, A5 5A)
+
+The receiver in the example sends 42-byte frames: header, 30-byte payload, 8 diagnostic bytes, then CRC16. The reader
+detects them on its own (`imu.frame_format: "auto"`) and checks the CRC. To unpack the payload, it needs the advisor's
+**`serial_protocol.py`**. Copy that file into the repo's `IMU/` folder, or set `DCKFT_SERIAL_PROTOCOL=/path/to/its/folder`.
+Without it, the reader stops and says so. The old frame format still works with no changes.
+
 ## 0. One-time setup (per Jetson)
 
 ```bash
