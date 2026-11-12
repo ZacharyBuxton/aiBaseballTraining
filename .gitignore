@@ -53,3 +53,6 @@ reports/
 sessions/
 *.svo2
 *.svo
+
+# Swing recorder app data (swings, logs)
+app_data/

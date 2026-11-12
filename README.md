@@ -85,6 +85,13 @@ Attack angle and vertical bat angle are the headline outputs, using Blast Motion
 the fusion and from the camera alone, with a camera quaternion built from the pink centroids. Setup and details are in
 `docs/RUNBOOK.md`, under "Always-on capture".
 
+## Swing recorder app (Nov 2026)
+
+`python3 run_app.py` on the Orin, then open `http://<orin-ip>:8000` from any device. Press a button to record, and click
+any swing to see its render with attack angle and vertical bat angle. **Simulate swing** works without hardware, and
+**Update from GitHub** pulls the latest code. Swings are caught by an advisor-style ring buffer: 1200 frames before
+and 1200 after |ω| > 10 rad/s. See `docs/RUNBOOK.md`.
+
 ## Quick start
 
 ```bash
@@ -110,6 +117,8 @@ python -m dckft.run capture --port /dev/ttyUSB0      # records camera (no detect
 ## Repository layout
 
 ```
+run_app.py         Swing recorder web app (start here on the Orin)
+app/               Web app backend + pages (stdlib only)
 dckft/             Fusion engine, IMU reader, metrics, render, simulator (new; see dckft/README.md)
 Cameras/           ZED X capture + bat-marker tracker (publishes to the fusion engine)
 IMU/               IMU subsystem notes, sample capture, legacy Windows reader
