@@ -191,6 +191,26 @@ def impact_source(imu, fcfg):
 
 
 def detect_swings_imu(imu, fcfg) -> List[Swing]:
-    """detect_swings() on an ImuData with the full FusionConfig (trigger + impact source)."""
+    """
+    detect_swings() on an ImuData with the full FusionConfig (trigger + impact source).
+
+    Ball contact, in order of preference:
+      1. the firmware's impact flag (protocol-v2 receiver), when the frames carry it
+      2. a spike on the ICM45686 accelerometer (the main sensor)
+      3. a spike on the ADXL375, when its data are present. The ICM45686 clips at +-32 g and is
+         often near that late in the swing, so the impact spike can be flattened; the ADXL375
+         (+-200 g) is then used for contact TIMING only (swing.impact_fallback_adxl).
+    """
     sig, thr = impact_source(imu, fcfg)
-    return detect_swings(imu.t, imu.gyro, sig, fcfg.swing, imu.accel, thr)
+    swings = detect_swings(imu.t, imu.gyro, sig, fcfg.swing, imu.accel, thr)
+    for sw in swings:
+        win = (imu.t >= sw.t_onset) & (imu.t <= sw.t_end)
+        if imu.impact_flag is not None and np.any(imu.impact_flag[win]):
+            sw.t_contact = float(imu.t[win][np.argmax(imu.impact_flag[win])])
+            continue
+        if sw.t_contact is None and fcfg.swing.impact_fallback_adxl and np.any(imu.accel_hg[win]):
+            rate = 1.0 / np.median(np.diff(imu.t))
+            hits = impact_indices(imu.accel_hg[win], rate, fcfg.swing.contact_hg_ms2)
+            if len(hits):
+                sw.t_contact = float(imu.t[win][hits[0]])
+    return swings

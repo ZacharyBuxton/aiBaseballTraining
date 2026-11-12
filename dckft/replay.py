@@ -70,7 +70,8 @@ def replay(cam_path: str, imu_path: str, cam_bind="tcp://*:5557", imu_bind="tcp:
                               "accel": [r["accel_x"], r["accel_y"], r["accel_z"]],
                               "gyro": [r["omega_x"], r["omega_y"], r["omega_z"]],
                               "accel_hg": [r["accel_x2"], r["accel_y2"], r["accel_z2"]],
-                              "hf": [r.get("accel_hf_1", 0), r.get("accel_hf_2", 0), r.get("accel_hf_3", 0)]})
+                              "hf": [r.get("accel_hf_1", 0), r.get("accel_hf_2", 0), r.get("accel_hf_3", 0)],
+                              "impact_flag": int(r.get("impact_flag", 0) or 0)})
                 if len(batch) >= 8:
                     try:
                         isock.send_string(json.dumps({"type": "imu", "samples": batch}), zmq.NOBLOCK)

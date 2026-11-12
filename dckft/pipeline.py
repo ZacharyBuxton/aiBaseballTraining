@@ -141,7 +141,8 @@ class SwingResult:
 
 
 def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfig(),
-                  swing_index: int = -1, coach=None, verbose: bool = False) -> SwingResult:
+                  swing_index: int = -1, coach=None, verbose: bool = False,
+                  t_trigger: Optional[float] = None) -> SwingResult:
     tm = {}
     t_start = time.perf_counter()
 
@@ -157,7 +158,12 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
                            f"peak |omega| {np.linalg.norm(imu.gyro, axis=1).max():.1f} rad/s, peak "
                            f"| |a|-g | {np.abs(np.linalg.norm(imu.accel, axis=1) - 9.80665).max():.1f} "
                            f"m/s^2). Tune with: python -m dckft.trigger_tune --csv <imu.csv>")
-    sw = swings[swing_index]
+    if t_trigger is not None:
+        # ring-buffer window: analyse the swing that contains (or is nearest) the trigger frame
+        sw = min(swings, key=lambda s: 0.0 if s.t_onset - 0.05 <= t_trigger <= s.t_end
+                 else min(abs(s.t_onset - t_trigger), abs(s.t_end - t_trigger)))
+    else:
+        sw = swings[swing_index]
 
     # ---- time sync
     t1 = time.perf_counter()

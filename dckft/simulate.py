@@ -234,7 +234,7 @@ def write_session(sim: dict, out_dir: str) -> dict:
             tx = s.tx_us + wraps * 2 ** 32
             w.writerow([s.tx_us, (tx - tx0) / 1e6, host[k] - host[0], s.status,
                         *np.round(s.accel, 6), *np.round(s.gyro, 6), *np.round(s.accel_hg, 4),
-                        *np.round(s.hf, 4), int(round(host[k] * 1e9))])
+                        *np.round(s.hf, 4), int(round(host[k] * 1e9)), 0])
     with open(os.path.join(out_dir, "truth.json"), "w") as f:
         json.dump(sim["truth"], f, indent=2)
     return {"camera": cam_path, "imu": imu_path}

@@ -28,16 +28,19 @@ class ImuData:
     accel: np.ndarray        # (N,3) m/s^2 specific force, IMU body frame
     accel_hg: np.ndarray     # (N,3) m/s^2 ADXL375
     has_host_clock: bool = True
+    impact_flag: Optional[np.ndarray] = None   # (N,) firmware impact flag (protocol v2), if sent
 
     def __len__(self):
         return len(self.t)
 
     def slice(self, t0: float, t1: float) -> "ImuData":
         m = (self.t >= t0) & (self.t <= t1)
-        return ImuData(self.t[m], self.gyro[m], self.accel[m], self.accel_hg[m], self.has_host_clock)
+        return ImuData(self.t[m], self.gyro[m], self.accel[m], self.accel_hg[m], self.has_host_clock,
+                       None if self.impact_flag is None else self.impact_flag[m])
 
     def shifted(self, dt: float) -> "ImuData":
-        return ImuData(self.t + dt, self.gyro, self.accel, self.accel_hg, self.has_host_clock)
+        return ImuData(self.t + dt, self.gyro, self.accel, self.accel_hg, self.has_host_clock,
+                       self.impact_flag)
 
 
 def unwrap_tx_us(tx: np.ndarray) -> np.ndarray:
@@ -79,7 +82,8 @@ def load_imu_csv(path: str) -> ImuData:
         t = df["imu_meas_time"].to_numpy(float)
         host = False
     order = np.argsort(t, kind="stable")
-    return ImuData(t[order], gyro[order], accel[order], accel_hg[order], host)
+    flag = (df["impact_flag"].to_numpy(float)[order] > 0) if "impact_flag" in df else None
+    return ImuData(t[order], gyro[order], accel[order], accel_hg[order], host, flag)
 
 
 def imu_from_samples(samples: List[dict]) -> ImuData:
@@ -87,9 +91,11 @@ def imu_from_samples(samples: List[dict]) -> ImuData:
     tx = np.array([s["tx_us"] for s in samples])
     host = np.array([s["ts_ns_host"] for s in samples])
     t = map_device_clock(tx, host) if len(samples) > 10 else host * 1e-9
+    flag = (np.array([bool(s.get("impact_flag", 0)) for s in samples])
+            if any("impact_flag" in s for s in samples) else None)
     return ImuData(t, np.array([s["gyro"] for s in samples], float),
                    np.array([s["accel"] for s in samples], float),
-                   np.array([s["accel_hg"] for s in samples], float), True)
+                   np.array([s["accel_hg"] for s in samples], float), True, flag)
 
 
 # ------------------------------------------------------------------------ Camera

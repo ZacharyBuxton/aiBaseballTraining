@@ -135,7 +135,7 @@ class _Recorder:
         a, g, h, hf = s["accel"], s["gyro"], s["accel_hg"], s.get("hf", [0, 0, 0])
         self.imu.write(",".join(str(v) for v in [
             s["tx_us"], ((s["tx_us"] - self.tx0) % 2 ** 32) / 1e6, (s["ts_ns_host"] - self.h0) / 1e9,
-            4095, *a, *g, *h, *hf, s["ts_ns_host"]]) + "\n")
+            4095, *a, *g, *h, *hf, s["ts_ns_host"], int(s.get("impact_flag", 0))]) + "\n")
 
     def close(self):
         self.cam.close(); self.imu.close()
@@ -239,13 +239,43 @@ def cmd_postprocess(a, cfg: FusionConfig) -> int:
     return cmd_process(a, cfg)
 
 
+def make_ring(cfg: FusionConfig):
+    """The advisor's ring buffer, configured from cfg.swing (trigger + window size)."""
+    from .ring import SwingRing
+    sw = cfg.swing
+    if sw.trigger_source == "gyro":
+        sig, thr = (lambda s: float(np.linalg.norm(s["gyro"]))), sw.trigger_rads
+    else:
+        from .swing import trigger_signal
+        sig = lambda s: float(trigger_signal(np.asarray([s["gyro"]], float),
+                                             np.asarray([s["accel"]], float), sw, 1e9)[0][0])
+        thr = sw.trigger_accel_ms2
+    return SwingRing(sw.ring_pre_frames, sw.ring_post_frames, thr, signal_of=sig,
+                     max_dt_s=sw.ring_max_dt_us * 1e-6)
+
+
+def process_window(imu_w, payloads, cfg: FusionConfig, gravity=None, t_trigger=None):
+    """Fuse one ring-buffer window. Returns a SwingResult, or None (reason printed)."""
+    if len(payloads) < 10:
+        print(f"\n[live] swing triggered but only {len(payloads)} camera frames in its window -- "
+              "is the camera publishing and seeing the pink bands?")
+        return None
+    cam = payloads_to_camera(payloads, list(cfg.bat.marker_s_m))
+    cam.gravity_cam = gravity
+    try:
+        return process_swing(cam, imu_w, cfg, t_trigger=t_trigger)
+    except Exception as e:          # keep the session alive on a bad swing
+        print(f"\n[live] could not process swing: {e}")
+        return None
+
+
 def cmd_live(a, cfg: FusionConfig) -> int:
     """
     Always-on consumer: camera payloads (track_bat.py, live pink detection) and IMU samples
-    (dckft.imu.reader) stream in continuously and sit in rolling FIFO buffers. The IMU trigger
-    (swing.trigger_source) marks a swing; once the bat is held still at the finish and the
-    camera has caught up, the window around it is fused and rendered. Nothing is clipped to a
-    fixed-length video: the streams never stop between swings.
+    (dckft.imu.reader) stream in continuously. The IMU samples go through the advisor's ring
+    buffer (dckft.ring): a rising edge of |omega| > 10 rad/s with a full 3 s pre-roll starts a
+    window; 3 s later the window (6 s of IMU) plus the camera frames over the same span are
+    fused and rendered. The streams never stop between swings.
     """
     import zmq
     from .data import gravity_from_meta
@@ -266,21 +296,25 @@ def cmd_live(a, cfg: FusionConfig) -> int:
           f" {'rad/s' if cfg.swing.trigger_source == 'gyro' else 'm/s^2'}. Hold the stance ~1 s, "
           "swing, HOLD THE FINISH still. Ctrl+C to quit.")
 
-    buf_s = max(12.0, cfg.swing.pre_roll_s + cfg.swing.max_duration_s + 4.0)
-    cam_buf = deque(maxlen=int(150 * buf_s))
-    imu_buf = deque(maxlen=int(cfg.imu.nominal_rate_hz * 1.25 * buf_s))
-    det = LiveSwingDetector(cfg.swing)
+    from .imu.frames import TxClock
+    from .ring import CameraRing, SwingRing
+    sw_cfg = cfg.swing
+    rate = cfg.imu.nominal_rate_hz
+    window_s = (sw_cfg.ring_pre_frames + sw_cfg.ring_post_frames) / rate
+    ring = make_ring(cfg)
+    cam_ring = CameraRing(seconds=window_s + 6.0)
+    clock = TxClock()
     gravity = None
     meta_path = getattr(a, "camera_meta", None)
     show = not a.no_show
     if show:
         import matplotlib.pyplot as plt
         plt.ion()
-    last_check = 0.0
     n_swings = 0
     last_status = time.time()
-    pending = []                     # [(swing, w0, w1, t_triggered)] waiting for camera frames
-    look_s = cfg.swing.pre_roll_s + cfg.swing.max_duration_s + 2.0
+    pending = []                     # ring windows waiting for the camera to catch up
+    print(f"Ring buffer: {sw_cfg.ring_pre_frames} frames before + {sw_cfg.ring_post_frames} from "
+          f"the trigger ({window_s:.1f} s).")
     try:
         while True:
             events = dict(poller.poll(20))
@@ -292,7 +326,7 @@ def cmd_live(a, cfg: FusionConfig) -> int:
                         break
                     if rec:
                         rec.camera(msg)
-                    cam_buf.append(json.loads(msg))
+                    cam_ring.push(json.loads(msg))
             if imu_sock in events:
                 while True:
                     try:
@@ -302,7 +336,11 @@ def cmd_live(a, cfg: FusionConfig) -> int:
                     for smp in json.loads(msg).get("samples", []):
                         if rec:
                             rec.imu_sample(smp)
-                        imu_buf.append(smp)
+                        smp["t_dev_s"] = clock(int(smp["tx_us"])) * 1e-6
+                        win = ring.push(smp)
+                        if win is not None:
+                            print(f"\n[trigger] swing window complete ({len(win.samples)} frames)")
+                            pending.append((win, time.time()))
             if gravity is None and meta_path and os.path.exists(meta_path):
                 try:
                     with open(meta_path) as f:
@@ -315,47 +353,22 @@ def cmd_live(a, cfg: FusionConfig) -> int:
             now = time.time()
             if now - last_status > 2.0:
                 last_status = now
-                print(f"\r  buffers: camera {len(cam_buf):5d}  imu {len(imu_buf):5d}  "
-                      f"swings {n_swings}  waiting {len(pending)}", end="", flush=True)
+                print(f"\r  {ring.progress:32s} camera {len(cam_ring.buf):5d}  swings {n_swings}  "
+                      f"waiting {len(pending)}", end="", flush=True)
             if show:
                 plt.pause(0.001)
-            if now - last_check < 0.05 or len(imu_buf) < 200:
-                continue
-            last_check = now
-
-            # 1) trigger on the IMU (most recent few seconds only)
-            n_recent = int(cfg.imu.nominal_rate_hz * look_s)
-            imu = imu_from_samples(list(imu_buf)[-n_recent:])
-            sig, thr = impact_source(imu, cfg)
-            sw = det.update(now, imu.t, imu.gyro, sig, imu.accel, thr)
-            if sw is not None:
-                print(f"\n[trigger] swing at {time.strftime('%H:%M:%S', time.localtime(sw.t_onset))}"
-                      f" ({sw.t_end - sw.t_onset:.2f} s, finish held)")
-                pending.append((sw, sw.t_onset - cfg.swing.pre_roll_s - 0.3,
-                                sw.t_end + cfg.swing.post_roll_s + 0.3, now))
-
-            # 2) process a pending swing once the camera has caught up (or after 1.5 s)
             if not pending:
                 continue
-            sw, w0, w1, t_trig = pending[0]
-            cam_latest = cam_buf[-1]["ts_ns_image"] * 1e-9 if cam_buf else -1e18
-            if cam_latest < w1 and now - t_trig < 1.5:
-                continue
+            win, t_done = pending[0]
+            imu_w = imu_from_samples(win.samples)
+            w0, w1 = imu_w.t[0], imu_w.t[-1]
+            if cam_ring.latest_t() < w1 and now - t_done < 1.5:
+                continue                       # wait for the camera to deliver the window
             pending.pop(0)
             t_detect = time.perf_counter()
-            imu_all = imu_from_samples(list(imu_buf))
-            imu_w = imu_all.slice(w0, w1)
-            cams = [p for p in cam_buf if w0 - 0.3 <= p["ts_ns_image"] * 1e-9 <= w1 + 0.3]
-            if len(cams) < 10:
-                print(f"\n[live] swing triggered but only {len(cams)} camera frames in its window -- "
-                      "is the camera publishing and seeing the pink bands?")
-                continue
-            cam = payloads_to_camera(cams, list(cfg.bat.marker_s_m))
-            cam.gravity_cam = gravity
-            try:
-                res = process_swing(cam, imu_w, cfg)
-            except Exception as e:      # keep the session alive on a bad swing
-                print(f"\n[live] could not process swing: {e}")
+            res = process_window(imu_w, cam_ring.cut(w0 - 0.3, w1 + 0.3), cfg, gravity,
+                                 float(imu_w.t[win.trigger_index]))
+            if res is None:
                 continue
             n_swings += 1
             out_dir = os.path.join(session, f"swing_{n_swings:02d}")
@@ -369,8 +382,8 @@ def cmd_live(a, cfg: FusionConfig) -> int:
                 render_swing(res, cfg.bat, cfg.render, out_dir, title=f"Swing {n_swings}")
                 if show:
                     plt.pause(0.05)
-            latency = time.perf_counter() - t_detect + cfg.swing.post_roll_s
-            print(f"  swing end -> render: {latency:.2f} s (spec < 5 s)")
+            latency = time.perf_counter() - t_detect
+            print(f"  window complete -> render: {latency:.2f} s (spec < 5 s)")
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:

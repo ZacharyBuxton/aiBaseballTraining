@@ -42,7 +42,9 @@ class BatConfig:
 class ImuConfig:
     port: Optional[str] = None          # None = auto-detect /dev/ttyUSB* / ttyACM* / COMx
     baud: int = 921600
-    frame_format: str = "v1"            # dckft/imu/frames.py FORMATS; add the new firmware there
+    # "auto" picks per receiver: the RX node's 42-byte A5 5A protocol-v2 frames (needs the advisor's
+    # serial_protocol.py in IMU/) or the original 30-byte v1 frames. Or force "rx_v2_42B" / "v1".
+    frame_format: str = "auto"
     frame_size: int = 30                # informational; the format defines the real size
     sync_word: int = 4095               # status word in the last 2 bytes of every valid frame
     zmq_bind: Optional[str] = "tcp://*:5558"
@@ -89,18 +91,25 @@ class EkfConfig:
 
 @dataclass
 class SwingConfig:
-    # IMU trigger (advisor, Nov 5): acceleration. accel_mag | accel_xy | accel_-y (wire side up,
-    # bottom hand) | accel_+x ... | gyro. Tune with: python -m dckft.trigger_tune --csv imu.csv
-    trigger_source: str = "accel_mag"
+    # Swing trigger. Default matches the advisor's ring-buffer example (Nov 12): |omega| of the
+    # ICM45686 > trigger_rads, rising edge. Alternatives (Nov 5 notes): accel_mag | accel_xy |
+    # accel_-y (wire side up, bottom hand) | accel_+x ... Tune with: python -m dckft.trigger_tune
+    trigger_source: str = "gyro"
     trigger_accel_ms2: float = 30.0     # ~3 g beyond gravity; real swings reach 10-30 g at the hand
     onset_rads: float = 4.0             # |omega| crossing that marks swing start (searching back)
-    trigger_rads: float = 10.0          # used when trigger_source == "gyro" (~570 dps)
+    trigger_rads: float = 10.0          # |omega| trigger (rad/s, ~570 dps), as in the example
+    # Ring buffer (advisor example): frames kept before the trigger frame / from it onward,
+    # and the largest device-time step allowed inside one window (bigger = missing frames).
+    ring_pre_frames: int = 1200         # 3 s at 400 Hz
+    ring_post_frames: int = 1200        # 3 s at 400 Hz
+    ring_max_dt_us: float = 3750.0
     end_rads: float = 4.0
     min_gap_s: float = 1.5
     pre_roll_s: float = 1.0             # data kept before onset (stance -> calibration)
     post_roll_s: float = 0.4
     contact_hg_ms2: float = 300.0       # ADXL375 spike threshold for ball contact (~30 g)
     contact_icm_ms2: float = 120.0      # ICM45686 spike threshold (it clips at +-32 g = 313 m/s^2)
+    impact_fallback_adxl: bool = True   # contact timing from the ADXL375 if the ICM spike is clipped
     end_hold_s: float = 0.10           # finish after sustained low wrist rate (hold the finish)
     end_requires_still_accel: bool = True   # ...and |a| within still_accel_ms2 of 1 g
     still_accel_ms2: float = 3.0

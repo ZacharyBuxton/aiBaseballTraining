@@ -97,6 +97,11 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
     headline = (speed_label + ": %.1f mph" % m.bat_speed_mph
                 if m.speed_reliable else "Barrel speed: unavailable (tracking gap)")
     fig.suptitle(headline, fontsize=15, weight="bold")
+    # The two angles the advisor wants (Blast definitions), one line under the headline
+    deg = lambda v: "%+.1f\u00b0" % v if np.isfinite(v) else "unavailable"
+    fig.text(.5, .925, "Attack angle %s     Vertical bat angle %s"
+             % (deg(m.attack_angle_deg), deg(m.vertical_bat_angle_deg)),
+             ha="center", fontsize=13, color="0.15")
     import textwrap
     footer = ("Dry swing: no impact measured. " if not m.contact_detected else "Impact detected. ")
     footer += "Replay ends with the swing; gaps are hidden. Calibration RMS: %.1f deg. " % result.calib.rms_axis_deg
