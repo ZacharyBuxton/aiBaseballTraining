@@ -39,7 +39,7 @@ from typing import Optional
 import numpy as np
 
 from ..config import ImuConfig, load_config
-from .frames import CSV_COLUMNS, FrameParser, ImuSample, TxClock
+from .frames import CSV_COLUMNS, FrameParser, ImuSample, TxClock, make_parser
 
 
 def list_ports():
@@ -84,7 +84,7 @@ class CsvSink:
         self.w.writerow([
             s.tx_us, (tx - self.tx0) / 1e6, (s.ts_ns_host - self.host0) / 1e9, s.status,
             *np.round(s.accel, 6), *np.round(s.gyro, 6), *np.round(s.accel_hg, 4),
-            *np.round(s.hf, 4), s.ts_ns_host,
+            *np.round(s.hf, 4), s.ts_ns_host, s.impact_flag,
         ])
 
     def close(self):
@@ -133,7 +133,7 @@ def run_serial(cfg: ImuConfig, sinks, max_samples: int = 0, duration_s: float = 
         raise SystemExit("No serial port found. Plug in the radio receiver or pass --port.")
     ser = serial.Serial(port, cfg.baud, timeout=0.02)
     ser.reset_input_buffer()
-    parser = FrameParser(cfg)
+    parser = make_parser(cfg)
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
     n = 0

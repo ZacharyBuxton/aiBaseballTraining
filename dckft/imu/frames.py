@@ -76,8 +76,11 @@ FORMATS = {
 
 
 def frame_format(cfg: ImuConfig) -> FrameFormat:
+    """The struct-style layout. "auto" / "rx_v2_42B" select a parser in make_parser(); for
+    encoding (simulator, tests) and table lookups they fall back to v1."""
+    name = "v1" if cfg.frame_format in ("auto", "rx_v2_42B") else cfg.frame_format
     try:
-        return FORMATS[cfg.frame_format]
+        return FORMATS[name]
     except KeyError:
         raise ValueError(f"Unknown imu.frame_format {cfg.frame_format!r}; known: {list(FORMATS)}")
 
@@ -88,7 +91,7 @@ CSV_COLUMNS = [
     "tx_time_stamp", "imu_meas_time", "system_time", "status_var_value",
     "accel_x", "accel_y", "accel_z", "omega_x", "omega_y", "omega_z",
     "accel_x2", "accel_y2", "accel_z2", "accel_hf_1", "accel_hf_2", "accel_hf_3",
-    "ts_ns_host",
+    "ts_ns_host", "impact_flag",
 ]
 
 
@@ -101,12 +104,14 @@ class ImuSample:
     hf: np.ndarray             # extra high-g channels (legacy scaling)
     status: int
     ts_ns_host: int = 0        # host time.time_ns() when the frame was decoded
+    impact_flag: int = 0       # firmware impact flag (protocol-v2 receiver only)
 
     def to_dict(self) -> dict:
         return {
             "tx_us": int(self.tx_us), "ts_ns_host": int(self.ts_ns_host),
             "accel": self.accel.tolist(), "gyro": self.gyro.tolist(),
             "accel_hg": self.accel_hg.tolist(), "hf": self.hf.tolist(),
+            "impact_flag": int(self.impact_flag),
         }
 
 
@@ -234,3 +239,46 @@ class TxClock:
             self.wraps += 1
         self.last = tx_us
         return tx_us + self.wraps * 2 ** 32
+
+
+class AutoParser:
+    """Looks at the first bytes from the receiver and picks the right parser:
+    42-byte A5 5A protocol-v2 frames (advisor's RX node) or the original 30-byte v1 frames."""
+
+    def __init__(self, cfg: ImuConfig = ImuConfig()):
+        self.cfg = cfg
+        self.inner = None
+        self.pending = bytearray()
+        self.kind = None
+
+    def __getattr__(self, name):            # good / resyncs / skipped_bytes of the chosen parser
+        inner = self.__dict__.get("inner")
+        if inner is None:
+            if name in ("good", "resyncs", "skipped_bytes"):
+                return 0
+            raise AttributeError(name)
+        return getattr(inner, name)
+
+    def feed(self, data: bytes, ts_ns_host: int = 0) -> List[ImuSample]:
+        if self.inner is not None:
+            return self.inner.feed(data, ts_ns_host)
+        from .protocol_v2 import V2Parser, looks_like_v2
+        self.pending.extend(data)
+        if looks_like_v2(bytes(self.pending)):
+            self.inner, self.kind = V2Parser(self.cfg), "rx_v2_42B"
+        elif len(self.pending) >= 600:
+            self.inner, self.kind = FrameParser(self.cfg), "v1"
+        else:
+            return []
+        buf, self.pending = bytes(self.pending), bytearray()
+        return self.inner.feed(buf, ts_ns_host)
+
+
+def make_parser(cfg: ImuConfig = ImuConfig()):
+    """Parser for imu.frame_format: "auto" (default), "rx_v2_42B", or a FORMATS name ("v1")."""
+    if cfg.frame_format == "auto":
+        return AutoParser(cfg)
+    if cfg.frame_format == "rx_v2_42B":
+        from .protocol_v2 import V2Parser
+        return V2Parser(cfg)
+    return FrameParser(cfg)
