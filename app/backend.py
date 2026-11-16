@@ -91,7 +91,8 @@ class Backend:
 
     def status(self) -> dict:
         return {"mode": self.mode, "message": self.message, "busy": self.busy,
-                "ring": self.ring.progress if self.ring is not None else None,
+                "ring": (f"{self.ring.progress}, resets from IMU gaps: {self.ring.discontinuities}"
+                         if self.ring is not None else None),
                 "frames": self.n_frames, "log": list(self.log)[-12:],
                 "config": self.config_path or "(defaults: example bat geometry)",
                 "trigger": self._trigger_text()}
@@ -249,7 +250,54 @@ class Backend:
             self.stop_evt.set()
             if self.thread:
                 self.thread.join(timeout=30)
+                if self.thread.is_alive():
+                    self.say("Finishing recording and processing. Please wait.")
+                    return
         self.mode = "idle"
+
+    def _save_manual_session(self, session):
+        """Process one swing from the completed Start/Stop recording (fallback when the ring never fired)."""
+        import csv
+        from dckft.data import gravity_from_meta
+
+        samples = []
+        with open(os.path.join(session, "imu_session.csv")) as f:
+            for row in csv.DictReader(f):
+                samples.append({
+                    "tx_us": int(row["tx_time_stamp"]),
+                    "ts_ns_host": int(row["ts_ns_host"]),
+                    "accel": [float(row["accel_" + a]) for a in "xyz"],
+                    "gyro": [float(row["omega_" + a]) for a in "xyz"],
+                    "accel_hg": [float(row.get("accel_" + a + "2", 0) or 0) for a in "xyz"],
+                    "hf": [float(row.get("accel_hf_" + str(i), 0) or 0) for i in (1, 2, 3)],
+                    "impact_flag": int(float(row.get("impact_flag", 0) or 0)),
+                })
+        if len(samples) < 10:
+            self.say("Not enough IMU data. Raw recording kept: " + session)
+            return
+
+        with open(os.path.join(session, "camera_session.jsonl")) as f:
+            payloads = [json.loads(line) for line in f if line.strip()]
+        if len(payloads) < 10:
+            self.say("Not enough camera positions. Raw recording kept: " + session)
+            return
+
+        gravity = None
+        meta_path = os.path.join(session, "camera_session.jsonl.meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                gravity = gravity_from_meta(json.load(f))
+
+        imu = imu_from_samples(samples)
+        peak = int(np.argmax(np.linalg.norm(imu.gyro, axis=1)))
+        t_peak = float(imu.t[peak])
+        # Keep +/-3 s around the fastest moment (same size as a ring window)
+        keep = np.flatnonzero(np.abs(imu.t - t_peak) <= 3.0)
+        samples = samples[keep[0]:keep[-1] + 1]
+        payloads = [p for p in payloads if abs(p["ts_ns_image"] * 1e-9 - t_peak) <= 3.3]
+
+        self.say("Processing the recorded swing. Raw data: " + session)
+        self._save_window(samples, payloads, t_peak, "hardware (web Stop capture)", gravity)
 
     def _spawn(self, log_dir):
         py = sys.executable
@@ -276,6 +324,7 @@ class Backend:
         session = os.path.join(DATA, "sessions", time.strftime("%Y%m%d_%H%M%S"))
         os.makedirs(session, exist_ok=True)
         self.n_frames = {"imu": 0, "camera": 0}
+        saved_windows = 0
         try:
             self._spawn(session)
             self.say("Starting IMU reader and camera ... (logs in app_data/sessions/)")
@@ -321,11 +370,15 @@ class Backend:
                             if win is not None:
                                 self.say("Swing triggered -- processing")
                                 pending.append((win, time.time()))
-                if not said_ready and self.n_frames["imu"] > 400:
+                if not said_ready and len(ring.pre) >= ring.PRE:
                     said_ready = True
-                    self.say("Recording. Hold the stance ~1 s, swing, hold the finish.")
+                    self.say("Ready: swing any time (or swing once, then press Stop).")
                 if not said_ready and time.time() - t_start > 15:
-                    self.say("No IMU data after 15 s -- check the receiver / port (imu.log).")
+                    if self.n_frames["imu"] == 0:
+                        self.say("No IMU data after 15 s -- check the receiver / port (imu.log).")
+                    else:
+                        self.say(f"IMU data is arriving, but gaps keep resetting the ring buffer "
+                                 f"({ring.discontinuities} resets). Swing once, then press Stop.")
                     t_start = time.time()
                 if gravity is None and os.path.exists(meta_path):
                     try:
@@ -338,8 +391,11 @@ class Backend:
                     imu_w = imu_from_samples(win.samples)
                     if cam_ring.latest_t() >= imu_w.t[-1] or time.time() - t_done > 1.5:
                         pending.pop(0)
-                        self._save_window(win.samples, cam_ring.cut(imu_w.t[0] - 0.3, imu_w.t[-1] + 0.3),
-                                          float(imu_w.t[win.trigger_index]), "hardware", gravity)
+                        sid = self._save_window(win.samples,
+                                                cam_ring.cut(imu_w.t[0] - 0.3, imu_w.t[-1] + 0.3),
+                                                float(imu_w.t[win.trigger_index]), "hardware", gravity)
+                        if sid is not None:
+                            saved_windows += 1
         except Exception as e:
             self.say(f"Hardware loop error: {e}")
             traceback.print_exc()
@@ -355,5 +411,11 @@ class Backend:
                 log.close()
             self.procs = []
             self.ring = None
+            if self.stop_evt.is_set() and saved_windows == 0:
+                try:
+                    self._save_manual_session(session)
+                except Exception as e:
+                    self.say(f"Could not process recording: {e}. Raw data kept: {session}")
+                    traceback.print_exc()
             self.mode = "idle"
-            self.say("Recording stopped.")
+            self.say("Recording stopped. Check the swing list and log.")
