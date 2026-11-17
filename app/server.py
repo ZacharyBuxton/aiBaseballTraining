@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import html
 import json
-import mimetypes
 import os
 import sys
 import threading
@@ -21,6 +20,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
 from .backend import SWINGS, Backend, git_info, git_pull
+
+# Fixed content types: on Windows, mimetypes reads the registry, which can report wrong types
+TYPES = {".png": "image/png", ".mp4": "video/mp4", ".json": "application/json",
+         ".csv": "text/csv; charset=utf-8", ".jsonl": "text/plain; charset=utf-8",
+         ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8"}
 
 STYLE = """
 :root{--bg:#fafafa;--fg:#1a1a1a;--muted:#666;--card:#fff;--line:#ddd;--pink:#e0187a}
@@ -103,7 +107,8 @@ def swing_page(d: dict) -> str:
            f"vertical {deg(m.get('vertical_bat_angle_cam_deg'))}") if m else ""
     files = "".join(f'<a href="/files/{sid}/{html.escape(n)}">{html.escape(n)}</a> &nbsp; '
                     for n in d.get("files", []))
-    img = (f'<img src="/files/{sid}/swing.png" alt="swing render">' if "swing.png" in d.get("files", [])
+    img = (f'<a href="/files/{sid}/swing.png" target=_blank><img src="/files/{sid}/swing.png" '
+           f'alt="swing render (click to open)"></a>' if "swing.png" in d.get("files", [])
            else "<div class=muted>No render (processing failed — see status).</div>")
     keys = ("time_offset_ms", "camera_coverage", "calib_rms_axis_deg", "sync_correlation")
     dtext = ", ".join(f"{k} {diag.get(k)}" for k in keys if k in diag)
@@ -160,7 +165,7 @@ def make_handler(backend: Backend, restart):
                     if os.path.isfile(path):
                         with open(path, "rb") as f:
                             return self._send(200, f.read(),
-                                              mimetypes.guess_type(name)[0] or "application/octet-stream")
+                                              TYPES.get(os.path.splitext(name)[1].lower(), "application/octet-stream"))
                 return self._send(404, "Not found", "text/plain")
             return self._send(404, "Not found", "text/plain")
 
@@ -192,11 +197,34 @@ def make_handler(backend: Backend, restart):
     return H
 
 
+def relaunch():
+    """Start this app again with the same arguments (after git pull). Linux, Mac and Windows."""
+    os.environ["DCKFT_APP_PULLED"] = "1"
+    if os.name == "nt":               # os.execv on Windows detaches from the terminal: run a child instead
+        import subprocess
+        sys.exit(subprocess.call([sys.executable] + sys.argv))
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _bind(host, port, handler):
+    for _ in range(20):               # the previous instance may still be releasing the port
+        try:
+            return ThreadingHTTPServer((host, port), handler)
+        except OSError:
+            time.sleep(0.5)
+    return ThreadingHTTPServer((host, port), handler)
+
+
 def serve(backend: Backend, host="0.0.0.0", port=8000, restart=None):
-    def default_restart():
+    box = {"restart": False}
+
+    def request_restart():            # Update button: stop serving, then relaunch from the main thread
         time.sleep(1.0)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-    httpd = ThreadingHTTPServer((host, port), make_handler(backend, restart or default_restart))
+        box["restart"] = True
+        box["httpd"].shutdown()
+
+    httpd = _bind(host, port, make_handler(backend, restart or request_restart))
+    box["httpd"] = httpd
     print(f"DC-KFT app on http://{host}:{port}  (Ctrl+C to quit)")
     try:
         httpd.serve_forever()
@@ -205,3 +233,6 @@ def serve(backend: Backend, host="0.0.0.0", port=8000, restart=None):
     finally:
         backend.stop()
         httpd.server_close()
+    if box["restart"]:
+        print("Restarting with the updated code ...")
+        relaunch()
