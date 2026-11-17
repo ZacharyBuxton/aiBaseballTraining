@@ -37,13 +37,13 @@ def main(argv=None) -> int:
     ap.add_argument("--no-pull", action="store_true", help="don't git pull on start")
     a = ap.parse_args(argv)
 
-    from app.backend import git_pull, git_info
     if not a.no_pull and os.environ.get("DCKFT_APP_PULLED") != "1":
+        # Pull before any project module is imported, so the new code is what runs (no restart)
+        import subprocess
         print("Checking GitHub for updates ...")
-        print(git_pull())
-        os.environ["DCKFT_APP_PULLED"] = "1"
-        # restart once so freshly pulled code is what actually runs
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        r = subprocess.run(["git", "pull", "--ff-only"], cwd=ROOT, capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip() or "git pull done")
+    from app.backend import git_info
     info = git_info()
     print(f"Code: {info['commit']} ({info['date']}) {info['subject']}")
 
@@ -56,13 +56,7 @@ def main(argv=None) -> int:
     backend.say("App started." + ("" if config else
                 " No measured bat config found: using example geometry (run run_schema.py once)."))
 
-    def restart():
-        import time
-        time.sleep(1.0)
-        os.environ["DCKFT_APP_PULLED"] = "1"         # the Update button already pulled
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    serve(backend, a.host, a.http_port, restart)
+    serve(backend, a.host, a.http_port)           # Update button: git pull, then relaunch
     return 0
 
 
