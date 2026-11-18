@@ -50,7 +50,13 @@ INDEX = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport co
   <div><b>Status:</b> <span id=msg>...</span></div>
   <div class=muted id=ring></div>
   <div style="margin-top:8px">
-    <button class=primary id=start onclick="post('/api/start')">Start recording (camera + IMU)</button>
+    <label>Camera mode <select id=captureMode>
+      <option value="120fps">High FPS: 960 × 600, 120 FPS</option>
+      <option value="1080p60">High quality: 1920 × 1080, 60 FPS</option>
+    </select></label>
+    <label>Clip length <select id=captureSeconds><option value="5">5 seconds</option>
+      <option value="10">10 seconds</option></select></label><br>
+    <button class=primary id=start onclick="post('/api/start')">Record one swing (camera + IMU)</button>
     <button id=stop onclick="post('/api/stop')">Stop</button>
     <button id=demo onclick="post('/api/demo')">Simulate swing (no hardware)</button>
     <button id=update onclick="update()">Update from GitHub</button>
@@ -63,16 +69,16 @@ INDEX = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport co
 <div class=card><b>Log</b><pre id=log></pre></div>
 </main><script>
 const f=(v,u)=>v===null||v===undefined?'n/a':(v>0&&u=='°'?'+':'')+v.toFixed(1)+u;
-async function post(u){const r=await fetch(u,{method:'POST'});const j=await r.json();if(j.message)document.getElementById('msg').textContent=j.message;tick()}
+async function post(u){const body=u==='/api/start'?JSON.stringify({capture_mode:captureMode.value,seconds:Number(captureSeconds.value)}):'{}';const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body});const j=await r.json();if(j.message)document.getElementById('msg').textContent=j.message;tick()}
 async function update(){if(!confirm('Pull the latest code from GitHub and restart the app?'))return;
  document.getElementById('msg').textContent='Updating...';const r=await fetch('/api/update',{method:'POST'});const j=await r.json();
  alert(j.output||j.message);setTimeout(()=>location.reload(),4000)}
 async function tick(){try{
  const s=await (await fetch('/api/status')).json();
  msg.textContent=s.message+(s.busy?'  (processing...)':'');ring.textContent=s.ring?('Ring buffer: '+s.ring+'  |  frames: IMU '+s.frames.imu+', camera '+s.frames.camera):'';
- trigger.textContent='Trigger: '+s.trigger;cfg.textContent='Config: '+s.config;
+ trigger.textContent='Record first → detect saved frames → camera-led replay with IMU gap estimates. '+s.trigger;cfg.textContent='Config: '+s.config;
  git.textContent='Code: '+s.git.commit+' ('+s.git.date+') '+s.git.subject;
- start.disabled=s.mode!='idle';stop.disabled=s.mode!='hardware';demo.disabled=s.mode!='idle'||s.busy;update.disabled=s.mode!='idle'||s.busy;
+ captureMode.disabled=captureSeconds.disabled=s.mode!='idle';start.disabled=s.mode!='idle';stop.disabled=s.mode!='hardware';demo.disabled=s.mode!='idle'||s.busy;update.disabled=s.mode!='idle'||s.busy;
  log.textContent=s.log.join('\\n');
  const w=await (await fetch('/api/swings')).json();
  swings.innerHTML=w.map(x=>`<tr class=row onclick="location='/swing/${x.id}'"><td>${x.created||x.id}</td><td class=src>${x.source||''}</td>
@@ -110,8 +116,33 @@ def swing_page(d: dict) -> str:
     img = (f'<a href="/files/{sid}/swing.png" target=_blank><img src="/files/{sid}/swing.png" '
            f'alt="swing render (click to open)"></a>' if "swing.png" in d.get("files", [])
            else "<div class=muted>No render (processing failed — see status).</div>")
-    keys = ("time_offset_ms", "camera_coverage", "calib_rms_axis_deg", "sync_correlation")
+    replay = (f'<div id="replay" data-url="/files/{sid}/replay.json">'
+              '<canvas style="width:100%;height:420px;touch-action:none" aria-label="3D swing replay"></canvas>'
+              '<p class="replay-status">Loading replay...</p><button>Play</button>'
+              '<input type="range" min="0" max="1" value="0" step="1" aria-label="Replay frame" style="width:55%">'
+              '<select aria-label="Playback speed"><option value="0.25">¼ speed</option>'
+              '<option value="0.5">½ speed</option><option value="1">Normal speed</option></select>'
+              '<p class="muted">Drag to rotate; scroll to zoom. Pink: camera-supported. '
+              'Orange dashed: IMU/model estimate. Camera-supported poses include short interpolation '
+              'between observations. Estimated gap motion is excluded from speed validation.</p>'
+              '</div><script src="/replay.js" defer></script>'
+              if 'replay.json' in d.get('files', []) else '')
+    keys = ("time_offset_ms", "camera_coverage", "calib_rms_axis_deg", "sync_correlation", "imu_gaps_over_10ms")
     dtext = ", ".join(f"{k} {diag.get(k)}" for k in keys if k in diag)
+    quality = meta.get('camera_quality', {})
+    quality_text = ''
+    if quality:
+        fps = quality.get('effective_saved_fps')
+        fraction = quality.get('tracking_fraction_entire_clip', 0)
+        quality_text = ('Saved video: %s frames, %s FPS. Frames with raw 3D positions over the '
+                        'entire clip: %.1f%%. These counts include stance and finish.' %
+                        (quality.get('saved_frames'), 'n/a' if fps is None else '%.1f' % fps,
+                         100*fraction))
+    replay_info = diag.get('replay') or {}
+    estimated = replay_info.get('active_swing_estimated_fraction')
+    if estimated is not None:
+        quality_text += ' Active-swing replay: %.1f%% camera-supported, %.1f%% estimated.' % (
+            100*(1-estimated), 100*estimated)
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>Swing {sid}</title>
 <style>{STYLE}</style></head><body><main>
@@ -119,8 +150,9 @@ def swing_page(d: dict) -> str:
 <div class=muted>{html.escape(meta.get('created', ''))} · {html.escape(meta.get('source', ''))} ·
 status {html.escape(str(meta.get('status', '')))} · code {html.escape(str(meta.get('git', '')))}</div>
 <div class=grid>{grid}</div><div class=muted>{cam}</div>
-<div class=card>{img}</div>
-<div class=card><b>Diagnostics</b><div class=muted>{html.escape(dtext)}</div>
+<div class=card>{replay or img}</div>
+<details><summary>Static render</summary>{img}</details>
+<div class=card><b>Tracking quality</b><p>{html.escape(quality_text)}</p><div class=muted>{html.escape(dtext)}</div>
 <div class=muted>{html.escape(str(m.get('speed_note', '')))}</div></div>
 <div class=card><b>Files</b><div>{files}</div>
 <button onclick="if(confirm('Delete this swing?'))fetch('/api/delete/{sid}',{{method:'POST'}}).then(()=>location='/')">Delete swing</button></div>
@@ -148,6 +180,9 @@ def make_handler(backend: Backend, restart):
             p = unquote(self.path.split("?")[0])
             if p == "/":
                 return self._send(200, INDEX, "text/html; charset=utf-8")
+            if p == "/replay.js":
+                with open(os.path.join(os.path.dirname(__file__), 'replay.js')) as f:
+                    return self._send(200, f.read(), 'text/javascript; charset=utf-8')
             if p == "/api/status":
                 return self._json({**backend.status(), "git": git_info()})
             if p == "/api/swings":
@@ -172,7 +207,15 @@ def make_handler(backend: Backend, restart):
         def do_POST(self):
             p = unquote(self.path.split("?")[0])
             if p == "/api/start":
-                ok = backend.start_hardware()
+                try:
+                    size = int(self.headers.get('Content-Length', 0))
+                    if not 0 <= size <= 4096:
+                        raise ValueError('Invalid request size')
+                    options = json.loads(self.rfile.read(size) or b'{}')
+                    ok = backend.start_hardware(options.get('capture_mode', '120fps'),
+                                                options.get('seconds', 5))
+                except (ValueError, TypeError, AttributeError) as e:
+                    return self._json({'ok': False, 'message': str(e)}, 400)
                 return self._json({"ok": ok, "message": backend.message})
             if p == "/api/stop":
                 threading.Thread(target=backend.stop, daemon=True).start()
@@ -236,3 +279,4 @@ def serve(backend: Backend, host="0.0.0.0", port=8000, restart=None):
     if box["restart"]:
         print("Restarting with the updated code ...")
         relaunch()
+
