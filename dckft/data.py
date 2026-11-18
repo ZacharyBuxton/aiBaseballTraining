@@ -71,6 +71,8 @@ def map_device_clock(tx_us: np.ndarray, host_ns: np.ndarray) -> np.ndarray:
 def load_imu_csv(path: str) -> ImuData:
     import pandas as pd
     df = pd.read_csv(path)
+    if df.empty:
+        raise ValueError('IMU CSV is empty: no usable IMU samples were recorded')
     gyro = df[["omega_x", "omega_y", "omega_z"]].to_numpy(float)
     accel = df[["accel_x", "accel_y", "accel_z"]].to_numpy(float)
     hg_cols = ["accel_x2", "accel_y2", "accel_z2"]
@@ -205,3 +207,4 @@ def bat_line_from_markers(cam: CameraData, bat: BatConfig):
         # Re-solve k with unit-length u (the marker spacing is known, not a free scale)
         knob[i] = np.mean(pi - si[:, None] * u, axis=0)
     return knob, axis, count
+

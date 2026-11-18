@@ -47,7 +47,7 @@ def _set_equal(ax, pts):
 
 def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
                  out_dir: Optional[str] = None, title: str = "DC-KFT swing"):
-    """One bat, one broken-at-gaps path, one speed chart; stop at swing end."""
+    """Camera-led replay, labelled IMU/model gap estimates, separate speed validity."""
     import matplotlib
     if not rcfg.show:
         matplotlib.use("Agg")
@@ -55,6 +55,8 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
     from matplotlib.widgets import Button, Slider
 
     tr, sw, m = result.traj, result.swing, result.metrics
+    replay = getattr(result, 'replay', None)
+    pose = replay.traj if replay is not None else tr
     t = tr.t
     first = int(np.clip(np.searchsorted(t, sw.t_onset-.10), 0, len(t)-1))
     last = int(np.clip(np.searchsorted(t, sw.t_end, side="right")-1, first, len(t)-1))
@@ -63,22 +65,29 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
     valid = np.ones(len(t), bool) if tr.valid is None else tr.valid.copy()
     active = (t >= sw.t_onset) & (t <= sw.t_end)
     speed = tr.speed(bat.sweet_spot_s_m) * MPS_TO_MPH
-    visible = valid & np.isfinite(speed)
+    visible = np.isfinite(pose.knob).all(axis=1) & np.isfinite(pose.axis).all(axis=1)
+    estimated = replay.estimated if replay is not None else ~valid
+    valid &= ~estimated
     B = _display_basis(result.up)
-    origin = tr.knob[first]
+    origin = pose.knob[first]
     D = lambda p: (np.asarray(p)-origin) @ B.T
-    knob, tip = D(tr.knob), D(tr.point(bat.length_m))
-    path = D(tr.point(bat.sweet_spot_s_m))
-    path[~(visible & active)] = np.nan       # never draw a teleport across lost tracking
+    knob, tip = D(pose.knob), D(pose.point(bat.length_m))
+    path = D(pose.point(bat.sweet_spot_s_m))
+    path[~(visible & active)] = np.nan
+    camera_path, gap_path = path.copy(), path.copy()
+    camera_path[estimated] = np.nan
+    gap_path[~estimated] = np.nan
     trel = t-sw.t_onset
-    shown_speed = np.where(visible & active, speed, np.nan)
+    shown_speed = np.where(valid & active & np.isfinite(speed), speed, np.nan)
 
     fig = plt.figure(figsize=(11, 7))
     if fig.canvas.manager and hasattr(fig.canvas.manager, "set_window_title"):
         fig.canvas.manager.set_window_title(title)
     ax = fig.add_axes([.02,.28,.64,.65], projection="3d")
     axs = fig.add_axes([.69,.36,.28,.42])
-    ax.plot(*path[first:last+1].T, color="deeppink", lw=2)
+    ax.plot(*camera_path[first:last+1].T, color="deeppink", lw=2, label="Camera-supported")
+    ax.plot(*gap_path[first:last+1].T, color="darkorange", lw=2, ls="--", label="IMU/model gap estimate")
+    ax.legend(loc='lower left', fontsize=8)
     points = np.vstack([knob[first:last+1][visible[first:last+1]],
                         tip[first:last+1][visible[first:last+1]]])
     if not len(points):
@@ -104,17 +113,23 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
              ha="center", fontsize=13, color="0.15")
     import textwrap
     footer = ("Dry swing: no impact measured. " if not m.contact_detected else "Impact detected. ")
-    footer += "Replay ends with the swing; gaps are hidden. Calibration RMS: %.1f deg. " % result.calib.rms_axis_deg
+    footer += "Replay ends with the swing. Orange motion is an estimate, excluded from speed validation. "
+    footer += "Calibration RMS: %.1f deg. " % result.calib.rms_axis_deg
     footer += m.speed_note
     fig.text(.07,.20,textwrap.fill(footer,120),fontsize=9,color="0.35",va="top")
 
     def draw(k):
         k = int(np.clip(k, first, last))
         if visible[k]:
+            line.set_color('darkorange' if estimated[k] else '0.2')
+            line.set_linestyle('--' if estimated[k] else '-')
             line.set_data_3d(*np.vstack([knob[k],tip[k]]).T)
-            p = np.array([D(tr.point(s))[k] for s in bat.marker_s_m.values()])
+            p = np.array([D(pose.point(s))[k] for s in bat.marker_s_m.values()])
             dots.set_data_3d(*p.T)
-            status.set_text("%.3f s | estimate %.1f mph" % (trel[k], speed[k]))
+            dots.set_color('darkorange' if estimated[k] else 'deeppink')
+            source = 'IMU/model gap estimate' if estimated[k] else 'Camera-supported pose'
+            speed_text = ('%.1f mph' % speed[k]) if valid[k] and np.isfinite(speed[k]) else 'speed withheld'
+            status.set_text('%.3f s | %s\n%s' % (trel[k], source, speed_text))
         else:
             line.set_data_3d([],[],[]); dots.set_data_3d([],[],[])
             status.set_text("%.3f s | Tracking gap - pose/speed not shown" % trel[k])
@@ -177,4 +192,5 @@ def _save_video(fig, draw, frames, path):
                 w.grab_frame()
     except Exception as e:      # ffmpeg missing etc.
         print(f"[render] could not write {path}: {e}")
+
 

@@ -41,6 +41,7 @@ Other examples:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -78,6 +79,7 @@ def parse_args():
     p.add_argument("--zmq-bind", help="Override the PUSH bind address")
     p.add_argument("--no-zmq", action="store_true", help="Don't open the ZMQ socket")
     p.add_argument("--jsonl", help="Append every payload to this JSONL file")
+    p.add_argument("--frame-log", help="CSV of every processed image timestamp, including detection failures")
     p.add_argument("--camera-id", help="camera_id field in payloads")
     p.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (0 = no limit)")
     p.add_argument("--preview", action="store_true", help="Show annotated left/right images")
@@ -125,12 +127,20 @@ def record_only(cam, cfg, args) -> int:
           f"{args.record} ({args.codec}). Ctrl+C to stop.")
     n, drops0, t_last = 0, cam.dropped_frames(), time.monotonic()
     ts = deque(maxlen=240)
+    if args.frame_log:
+        os.makedirs(os.path.dirname(os.path.abspath(args.frame_log)), exist_ok=True)
+    frame_log = open(args.frame_log, 'w', newline='') if args.frame_log else None
+    writer = csv.writer(frame_log) if frame_log else None
+    if writer:
+        writer.writerow(['frame_id', 'ts_ns_image'])
     try:
         while True:
             t = cam.grab_timestamp_only()
             if t is None:
                 break
             n += 1
+            if writer:
+                writer.writerow([n, t])
             ts.append(t)
             if not args.quiet and time.monotonic() - t_last >= 1.0:
                 t_last = time.monotonic()
@@ -143,6 +153,8 @@ def record_only(cam, cfg, args) -> int:
     finally:
         dropped = cam.dropped_frames() - drops0
         cam.close()                     # also finalises the recording
+        if frame_log:
+            frame_log.close()
     print(f"Saved {n} frames to {args.record} (dropped {dropped})")
     return 0
 
@@ -168,13 +180,19 @@ def main() -> int:
             return 1
         return record_only(cam, cfg, args)
 
-    publisher = jsonl = None
+    publisher = jsonl = frame_log = None
     n_frames = n_published = 0
     labels = (list(cfg.markers.hues) if cfg.markers.layout == "colors"
               else band_labels(cfg.markers.layout, cfg.markers.n_bands))
     hits = {m: 0 for m in labels}
     try:
         info = cam.info()
+        if args.frame_log:
+            os.makedirs(os.path.dirname(os.path.abspath(args.frame_log)), exist_ok=True)
+            frame_log = open(args.frame_log, 'w', newline='')
+            frame_writer = csv.writer(frame_log)
+            frame_writer.writerow(['frame_id', 'ts_ns_image', 'left_candidates',
+                                   'right_candidates', 'accepted_3d', 'marker_ids'])
         calib = cam.calibration()
         print(f"Camera: {info['model']} S/N {info['serial_number']} | "
               f"{info['resolution'][0]}x{info['resolution'][1]} @ {info['fps']:.0f} fps | "
@@ -235,6 +253,9 @@ def main() -> int:
 
             left_dets, right_dets, points = detect_points(
                 frame, cfg, calib, det_left, det_right, labeler, args.depth_source)
+            if frame_log:
+                frame_writer.writerow([frame.frame_id, frame.ts_ns, len(left_dets), len(right_dets),
+                                       len(points), '|'.join(sorted(points))])
 
             for m in points:
                 hits[m] += 1
@@ -293,6 +314,8 @@ def main() -> int:
             publisher.close()
         if jsonl:
             jsonl.close()
+        if frame_log:
+            frame_log.close()
         if args.preview:
             cv.destroyAllWindows()
 
@@ -305,3 +328,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

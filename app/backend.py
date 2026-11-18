@@ -1,12 +1,10 @@
 """
 backend.py -- what the app's buttons drive.
 
-Two sources feed the SAME ring buffer + fusion + render path:
+Hardware records first and processes after capture. Demo data uses the ring buffer:
 
-  hardware  starts the IMU reader and the camera tracker (live pink detection) as background
-            processes. IMU samples go through the advisor's ring buffer (dckft.ring); each
-            completed window (3 s before + 3 s after the |omega| trigger) is cut together with
-            the camera frames over the same span, fused, rendered and saved as a swing.
+  hardware  records SVO + IMU CSV, closes both writers, detects every saved camera frame,
+            then aligns and fuses one swing. No live detection or fusion competes with capture.
   demo      "Simulate swing" makes a synthetic swing (dckft.simulate) and pushes its IMU samples
             through the same ring buffer, so the app can be tested with no camera or IMU.
 
@@ -16,6 +14,7 @@ fusion outputs (swing.json, fused.csv, markers*.csv, camera_orientation.csv) and
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import shutil
@@ -81,6 +80,9 @@ class Backend:
         self.stop_evt = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.ring = None
+        self.capture_mode = "120fps"
+        self.capture_seconds = 5.0
+        self.session = None
         self.n_frames = {"imu": 0, "camera": 0}
 
     # ------------------------------------------------------------------ status
@@ -95,7 +97,8 @@ class Backend:
                          if self.ring is not None else None),
                 "frames": self.n_frames, "log": list(self.log)[-12:],
                 "config": self.config_path or "(defaults: example bat geometry)",
-                "trigger": self._trigger_text()}
+                "trigger": self._trigger_text(), "session": self.session,
+                "capture_mode": self.capture_mode, "capture_seconds": self.capture_seconds}
 
     def _trigger_text(self) -> str:
         s = self.cfg.swing
@@ -103,8 +106,7 @@ class Backend:
             v = f"|omega| > {s.trigger_rads:g} rad/s"
         else:
             v = f"{s.trigger_source} > {s.trigger_accel_ms2:g} m/s^2"
-        return (f"{v}; {s.ring_pre_frames} frames before + {s.ring_post_frames} after "
-                f"({(s.ring_pre_frames + s.ring_post_frames) / self.cfg.imu.nominal_rate_hz:.0f} s)")
+        return f"{v}; record first, process after capture; no uninterrupted ring window required"
 
     # ------------------------------------------------------------------ swings
     def list_swings(self) -> list:
@@ -235,187 +237,215 @@ class Backend:
             self.mode = "idle"
 
     # ------------------------------------------------------------------ hardware
-    def start_hardware(self) -> bool:
-        if self.mode != "idle":
-            self.say(f"Already running ({self.mode}).")
-            return False
-        self.stop_evt.clear()
-        self.mode = "hardware"
-        self.thread = threading.Thread(target=self._hardware_loop, daemon=True)
-        self.thread.start()
+    def start_hardware(self, capture_mode="120fps", seconds=5.0) -> bool:
+        """Capture one bounded clip; detection and fusion run only after writers close."""
+        if capture_mode not in ("120fps", "1080p60"):
+            raise ValueError("Choose 120fps or 1080p60")
+        seconds = float(seconds)
+        if not np.isfinite(seconds) or not 3 <= seconds <= 15:
+            raise ValueError("Recording duration must be between 3 and 15 seconds")
+        with self.lock:
+            if self.mode != "idle" or self.busy:
+                self.say(f"Already running ({self.mode}).")
+                return False
+            self.capture_mode, self.capture_seconds = capture_mode, seconds
+            self.stop_evt.clear()
+            self.mode = "hardware"
+            self.thread = threading.Thread(target=self._hardware_loop, daemon=True)
+            self.thread.start()
         return True
 
     def stop(self) -> None:
         if self.mode == "hardware":
             self.stop_evt.set()
-            if self.thread:
-                self.thread.join(timeout=30)
-                if self.thread.is_alive():
-                    self.say("Finishing recording and processing. Please wait.")
-                    return
-        self.mode = "idle"
+            self.say("Finishing the clip, then processing the saved data ...")
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=30)
+        # The worker owns mode/busy until processing has actually finished.
 
-    def _save_manual_session(self, session):
-        """Process one swing from the completed Start/Stop recording (fallback when the ring never fired)."""
-        import csv
-        from dckft.data import gravity_from_meta
+    def _start_child(self, name, cmd, session):
+        log = open(os.path.join(session, name + ".log"), "w")
+        try:
+            proc = subprocess.Popen(cmd, cwd=REPO, stdout=log, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        except Exception:
+            log.close()
+            raise
+        self.procs.append((name, proc, log))
+        return proc
 
-        samples = []
-        with open(os.path.join(session, "imu_session.csv")) as f:
-            for row in csv.DictReader(f):
-                samples.append({
-                    "tx_us": int(row["tx_time_stamp"]),
-                    "ts_ns_host": int(row["ts_ns_host"]),
-                    "accel": [float(row["accel_" + a]) for a in "xyz"],
-                    "gyro": [float(row["omega_" + a]) for a in "xyz"],
-                    "accel_hg": [float(row.get("accel_" + a + "2", 0) or 0) for a in "xyz"],
-                    "hf": [float(row.get("accel_hf_" + str(i), 0) or 0) for i in (1, 2, 3)],
-                    "impact_flag": int(float(row.get("impact_flag", 0) or 0)),
-                })
-        if len(samples) < 10:
-            self.say("Not enough IMU data. Raw recording kept: " + session)
-            return
+    def _stop_children(self):
+        children, self.procs = self.procs, []
+        for _, proc, _ in children:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+        for _, proc, log in children:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            finally:
+                log.close()
 
-        with open(os.path.join(session, "camera_session.jsonl")) as f:
-            payloads = [json.loads(line) for line in f if line.strip()]
-        if len(payloads) < 10:
-            self.say("Not enough camera positions. Raw recording kept: " + session)
-            return
-
-        gravity = None
-        meta_path = os.path.join(session, "camera_session.jsonl.meta.json")
-        if os.path.exists(meta_path):
-            with open(meta_path) as f:
-                gravity = gravity_from_meta(json.load(f))
-
-        imu = imu_from_samples(samples)
-        peak = int(np.argmax(np.linalg.norm(imu.gyro, axis=1)))
-        t_peak = float(imu.t[peak])
-        # Keep +/-3 s around the fastest moment (same size as a ring window)
-        keep = np.flatnonzero(np.abs(imu.t - t_peak) <= 3.0)
-        samples = samples[keep[0]:keep[-1] + 1]
-        payloads = [p for p in payloads if abs(p["ts_ns_image"] * 1e-9 - t_peak) <= 3.3]
-
-        self.say("Processing the recorded swing. Raw data: " + session)
-        self._save_window(samples, payloads, t_peak, "hardware (web Stop capture)", gravity)
-
-    def _spawn(self, log_dir):
+    def _capture_commands(self, session):
+        from Cameras.config import load_config as load_camera_config
+        camera = load_camera_config(self.cam_config).to_dict()
+        fps = 120 if self.capture_mode == "120fps" else 60
+        camera["camera"].update(resolution="SVGA" if fps == 120 else "HD1080",
+                                 fps=fps, depth_mode="NONE")
+        camera["output"].update(zmq_bind=None, jsonl_path=None)
+        camera_path = os.path.join(session, "camera_config.json")
+        fusion_path = os.path.join(session, "fusion_config.json")
+        with open(camera_path, 'w') as f:
+            json.dump(camera, f, indent=2)
+        with open(fusion_path, 'w') as f:
+            json.dump(self.cfg.to_dict(), f, indent=2)
         py = sys.executable
-        imu_cmd = [py, "-u", "-m", "dckft.imu.reader", "--zmq-bind", "tcp://*:5558", "--quiet",
-                   "--csv", os.path.join(log_dir, "imu_session.csv")]
-        cam_cmd = [py, "-u", os.path.join(REPO, "Cameras", "track_bat.py"), "--quiet",
-                   "--zmq-bind", "tcp://*:5557", "--jsonl", os.path.join(log_dir, "camera_session.jsonl")]
+        imu = [py, '-u', '-m', 'dckft.imu.reader', '--no-zmq', '--quiet',
+               '--config', fusion_path, '--csv', os.path.join(session, 'imu_session.csv')]
         if self.imu_port:
-            imu_cmd += ["--port", self.imu_port]
-        if self.config_path:
-            imu_cmd += ["--config", self.config_path]
-            cam_cmd += ["--bat-config", self.config_path]
-        if self.cam_config:
-            cam_cmd += ["--config", self.cam_config]
-        for name, cmd in (("imu", imu_cmd), ("camera", cam_cmd)):
-            log = open(os.path.join(log_dir, name + ".log"), "w")
-            self.procs.append((name, subprocess.Popen(cmd, cwd=REPO, stdout=log,
-                                                      stderr=subprocess.STDOUT,
-                                                      start_new_session=True), log))
+            imu += ['--port', self.imu_port]
+        camera_cmd = [py, '-u', os.path.join(REPO, 'Cameras', 'track_bat.py'),
+                      '--config', camera_path, '--record-only', '--no-zmq',
+                      '--record', os.path.join(session, 'camera.svo2'),
+                      '--frame-log', os.path.join(session, 'capture_frames.csv'),
+                      '--max-frames', str(round(self.capture_seconds*fps))]
+        return imu, camera_cmd
 
     def _hardware_loop(self):
-        import zmq
-        from dckft.data import gravity_from_meta
-        session = os.path.join(DATA, "sessions", time.strftime("%Y%m%d_%H%M%S"))
+        session = os.path.join(DATA, 'sessions', time.strftime('%Y%m%d_%H%M%S')
+                               + f'_{time.time_ns() % 1000000:06d}')
+        self.session = session
         os.makedirs(session, exist_ok=True)
-        self.n_frames = {"imu": 0, "camera": 0}
-        saved_windows = 0
+        self.n_frames = {'imu': 0, 'camera': 0}
         try:
-            self._spawn(session)
-            self.say("Starting IMU reader and camera ... (logs in app_data/sessions/)")
-            ctx = zmq.Context.instance()
-            cam_sock = ctx.socket(zmq.PULL); cam_sock.connect("tcp://127.0.0.1:5557")
-            imu_sock = ctx.socket(zmq.PULL); imu_sock.connect("tcp://127.0.0.1:5558")
-            poller = zmq.Poller()
-            poller.register(cam_sock, zmq.POLLIN); poller.register(imu_sock, zmq.POLLIN)
-            ring = make_ring(self.cfg)
-            self.ring = ring
-            sw = self.cfg.swing
-            cam_ring = CameraRing(seconds=(sw.ring_pre_frames + sw.ring_post_frames) /
-                                  self.cfg.imu.nominal_rate_hz + 6)
-            clock = TxClock()
-            gravity = None
-            meta_path = os.path.join(session, "camera_session.jsonl.meta.json")
-            pending = []
-            t_start = time.time()
-            said_ready = False
-            while not self.stop_evt.is_set():
-                dead = [n for n, p, _ in self.procs if p.poll() is not None]
-                if dead:
-                    self.say(f"{' and '.join(dead)} stopped -- see its log in {session}")
+            imu_cmd, camera_cmd = self._capture_commands(session)
+            self.say('Opening the camera and IMU. Wait for RECORDING NOW before swinging.')
+            self._start_child('imu', imu_cmd, session)
+            proc = self._start_child('camera', camera_cmd, session)
+            begun, start = False, time.monotonic()
+            while proc.poll() is None:
+                if self.stop_evt.wait(.1):
                     break
-                events = dict(poller.poll(50))
-                if cam_sock in events:
-                    while True:
-                        try:
-                            cam_ring.push(json.loads(cam_sock.recv_string(zmq.NOBLOCK)))
-                            self.n_frames["camera"] += 1
-                        except zmq.Again:
-                            break
-                if imu_sock in events:
-                    while True:
-                        try:
-                            msg = imu_sock.recv_string(zmq.NOBLOCK)
-                        except zmq.Again:
-                            break
-                        for smp in json.loads(msg).get("samples", []):
-                            self.n_frames["imu"] += 1
-                            smp["t_dev_s"] = clock(int(smp["tx_us"])) * 1e-6
-                            win = ring.push(smp)
-                            if win is not None:
-                                self.say("Swing triggered -- processing")
-                                pending.append((win, time.time()))
-                if not said_ready and len(ring.pre) >= ring.PRE:
-                    said_ready = True
-                    self.say("Ready: swing any time (or swing once, then press Stop).")
-                if not said_ready and time.time() - t_start > 15:
-                    if self.n_frames["imu"] == 0:
-                        self.say("No IMU data after 15 s -- check the receiver / port (imu.log).")
-                    else:
-                        self.say(f"IMU data is arriving, but gaps keep resetting the ring buffer "
-                                 f"({ring.discontinuities} resets). Swing once, then press Stop.")
-                    t_start = time.time()
-                if gravity is None and os.path.exists(meta_path):
-                    try:
-                        with open(meta_path) as f:
-                            gravity = gravity_from_meta(json.load(f))
-                    except (OSError, ValueError):
-                        pass
-                if pending:
-                    win, t_done = pending[0]
-                    imu_w = imu_from_samples(win.samples)
-                    if cam_ring.latest_t() >= imu_w.t[-1] or time.time() - t_done > 1.5:
-                        pending.pop(0)
-                        sid = self._save_window(win.samples,
-                                                cam_ring.cut(imu_w.t[0] - 0.3, imu_w.t[-1] + 0.3),
-                                                float(imu_w.t[win.trigger_index]), "hardware", gravity)
-                        if sid is not None:
-                            saved_windows += 1
+                with open(os.path.join(session, 'camera.log'), errors='replace') as f:
+                    lines = f.read()
+                if not begun and 'Recording ' in lines:
+                    begun, start = True, time.monotonic()
+                    self.say('RECORDING NOW: hold still 1 second, swing once, hold the finish. '
+                             'Capture stops automatically; Stop can end it earlier.')
+                if time.monotonic()-start > (self.capture_seconds+20 if begun else 30):
+                    raise RuntimeError('Camera timed out; see camera.log. Raw files are preserved.')
+            code = proc.poll()
+            self._stop_children()  # finalise SVO and CSV before any offline readers start
+            if code not in (None, 0):
+                raise RuntimeError('Camera recording failed; see camera.log')
+            svo = os.path.join(session, 'camera.svo2')
+            if not os.path.isfile(svo) or os.path.getsize(svo) == 0:
+                raise RuntimeError('No camera video was saved; see camera.log')
+            self.mode, self.busy = 'processing', True
+            self.say('Clip saved. Detecting pink bands in every saved frame ...')
+            self._detect_recording(session)
+            self.say('Camera processing finished. Aligning IMU and building camera-led replay ...')
+            self._save_recorded_session(session)
         except Exception as e:
-            self.say(f"Hardware loop error: {e}")
+            self.say(f'Capture/processing failed: {e}. Raw session kept: {session}')
             traceback.print_exc()
         finally:
-            for name, p, log in self.procs:
-                if p.poll() is None:
-                    p.send_signal(signal.SIGINT)
-            for name, p, log in self.procs:
-                try:
-                    p.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    p.terminate()
-                log.close()
-            self.procs = []
-            self.ring = None
-            if self.stop_evt.is_set() and saved_windows == 0:
-                try:
-                    self._save_manual_session(session)
-                except Exception as e:
-                    self.say(f"Could not process recording: {e}. Raw data kept: {session}")
-                    traceback.print_exc()
-            self.mode = "idle"
-            self.say("Recording stopped. Check the swing list and log.")
+            self._stop_children()
+            self.busy, self.mode = False, 'idle'
+
+    def _detect_recording(self, session):
+        cmd = [sys.executable, '-u', os.path.join(REPO, 'Cameras', 'track_bat.py'),
+               '--svo', os.path.join(session, 'camera.svo2'),
+               '--config', os.path.join(session, 'camera_config.json'),
+               '--bat-config', os.path.join(session, 'fusion_config.json'),
+               '--depth-source', 'stereo', '--no-zmq',
+               '--frame-log', os.path.join(session, 'camera_frames.csv'),
+               '--jsonl', os.path.join(session, 'camera_session.jsonl')]
+        proc = self._start_child('detection', cmd, session)
+        try:
+            code = proc.wait(timeout=300)
+            if code:
+                raise RuntimeError('Offline detection failed; see detection.log')
+        finally:
+            self._stop_children()
+
+    def _save_recorded_session(self, session):
+        from dckft.data import load_camera_jsonl, load_imu_csv
+        from dckft.pipeline import process_swing
+        from dckft.swing import detect_swings_imu
+        from dckft.render import render_swing
+        cam_path = os.path.join(session, 'camera_session.jsonl')
+        cam = load_camera_jsonl(cam_path, list(self.cfg.bat.marker_s_m))
+        if len(cam) < 10:
+            raise ValueError('Not enough optical positions; inspect detection.log and camera_frames.csv')
+        imu = load_imu_csv(os.path.join(session, 'imu_session.csv'))
+        self.n_frames = {'imu': len(imu), 'camera': len(cam)}
+        if len(imu) < 10:
+            raise ValueError('No usable IMU stream. Camera video is saved, but no IMU gap fill is possible')
+        swings = [s for s in detect_swings_imu(imu, self.cfg)
+                  if s.t_end >= cam.t[0]-self.cfg.sync.max_offset_s
+                  and s.t_onset <= cam.t[-1]+self.cfg.sync.max_offset_s]
+        if not swings:
+            raise ValueError('No swing found during the camera clip. Check IMU mounting/trigger and logs')
+        swing = max(swings, key=lambda s: s.peak_rads)
+        sid = os.path.basename(session)
+        d = os.path.join(SWINGS, sid)
+        os.makedirs(d, exist_ok=True)
+        for src, dst in [('imu_session.csv', 'imu.csv'), ('camera_session.jsonl', 'camera.jsonl'),
+                         ('camera_session.jsonl.meta.json', 'camera.jsonl.meta.json'),
+                         ('camera_frames.csv', 'camera_frames.csv'),
+                         ('capture_frames.csv', 'capture_frames.csv'),
+                         ('camera_config.json', 'camera_config.json'),
+                         ('fusion_config.json', 'fusion_config.json')]:
+            source = os.path.join(session, src)
+            if os.path.exists(source):
+                shutil.copy2(source, os.path.join(d, dst))
+        meta = {'created': time.strftime('%Y-%m-%d %H:%M:%S'), 'source': 'hardware (record first)',
+                'session': session, 'imu_frames': len(imu), 'camera_frames': len(cam),
+                'git': git_info()['commit'], 'config': self.config_path or 'defaults',
+                'status': 'processing'}
+        self._write_meta(d, meta)
+        try:
+            res = process_swing(cam, imu, self.cfg, t_trigger=swing.t_peak)
+            quality = self._camera_quality(session)
+            with open(os.path.join(d, 'camera_quality.json'), 'w') as f:
+                json.dump(quality, f, indent=2)
+            self.n_frames['camera'] = quality['saved_frames']
+            res.save(d, self.cfg.bat)
+            self.cfg.render.show = False
+            render_swing(res, self.cfg.bat, self.cfg.render, d, title=f'Swing {sid}')
+            meta['status'] = 'ok' if res.metrics.speed_reliable else 'saved; review tracking quality'
+            meta['camera_quality'] = quality
+            self._write_meta(d, meta)
+            self.say(f'Swing {sid} saved. Camera coverage during swing: {res.camera_coverage:.0%}. '
+                     'Pink = camera-supported; orange = IMU/model estimate. '
+                     + ('' if res.metrics.speed_reliable else res.metrics.speed_note))
+            return sid
+        except Exception as e:
+            meta['status'] = 'failed: '+str(e)
+            self._write_meta(d, meta)
+            raise
+
+    @staticmethod
+    def _camera_quality(session):
+        with open(os.path.join(session, 'camera_frames.csv')) as f:
+            frames = list(csv.DictReader(f))
+        if not frames:
+            raise ValueError('No saved SVO frames decoded')
+        times = np.array([int(r['ts_ns_image']) for r in frames], dtype=np.int64)
+        n = len(times)
+        span = float((times[-1]-times[0])/1e9)
+        points = np.array([int(r['accepted_3d']) for r in frames])
+        return {'saved_frames': n, 'span_s': span,
+                'effective_saved_fps': (n-1)/span if span > 0 else None,
+                'max_frame_gap_ms': float(np.diff(times).max()/1e6) if n > 1 else None,
+                'nonincreasing_timestamps': int((np.diff(times) <= 0).sum()),
+                'frames_with_positions': int((points > 0).sum()),
+                'frames_with_two_or_more_markers': int((points >= 2).sum()),
+                'tracking_fraction_entire_clip': float((points > 0).mean())}
