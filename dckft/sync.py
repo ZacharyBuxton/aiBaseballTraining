@@ -16,7 +16,6 @@ are z-scored before correlating. Returns the offset to ADD to IMU times.
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import correlate, correlation_lags, savgol_filter
 
 
 def fill_nans(t: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -33,13 +32,35 @@ def fill_nans(t: np.ndarray, x: np.ndarray) -> np.ndarray:
 
 def axis_rate(t_cam: np.ndarray, axis: np.ndarray) -> np.ndarray:
     """|du/dt| from the camera bat-axis series (rad/s)."""
-    if len(t_cam) < 7:
-        return np.zeros(len(t_cam))
-    u = fill_nans(t_cam, axis)
-    u = u / np.linalg.norm(u, axis=1, keepdims=True)
-    dt = np.median(np.diff(t_cam))
-    du = savgol_filter(u, 7, 2, deriv=1, delta=dt, axis=0)
-    return np.linalg.norm(du, axis=1)
+    t_cam, axis = np.asarray(t_cam), np.asarray(axis)
+    out = np.full(len(t_cam), np.nan)
+    indices = np.flatnonzero(np.isfinite(axis).all(axis=1))
+    groups = np.split(indices, np.where(np.diff(t_cam[indices]) > .06)[0]+1)
+    for ix in groups:
+        if len(ix) < 3:
+            continue
+        tc, u = t_cam[ix], axis[ix]
+        if np.any(np.diff(tc) <= 0):
+            continue
+        u = u / np.linalg.norm(u, axis=1, keepdims=True)
+        # Differentiate on the real timestamps. A frame-count derivative exaggerates
+        # motion when published frames are irregular or absent.
+        du = np.gradient(u, tc-tc[0], axis=0, edge_order=2)
+        out[ix] = np.linalg.norm(du, axis=1)
+    return out
+
+
+def _supported_interp(times, values, grid, max_gap):
+    times, values = np.asarray(times), np.asarray(values)
+    ok = np.isfinite(times) & np.isfinite(values)
+    times, unique = np.unique(times[ok], return_index=True)
+    values = values[ok][unique]
+    if len(times) < 2:
+        return np.full(len(grid), np.nan)
+    result = np.interp(grid, times, values, left=np.nan, right=np.nan)
+    right = np.clip(np.searchsorted(times, grid), 1, len(times)-1)
+    result[(times[right]-times[right-1]) > max_gap] = np.nan
+    return result
 
 
 def _z(x):
@@ -60,18 +81,17 @@ def estimate_offset(t_cam, cam_rate, t_imu, imu_rate, max_offset_s: float = 0.15
     if t1 - t0 < 0.1:
         return 0.0, 0.0
     grid = np.arange(t0, t1, 1.0 / grid_hz)
-    a = _z(np.interp(grid, t_cam, cam_rate))
-    # IMU grid extends by max_offset on both sides so every lag sees full overlap
-    grid_i = np.arange(t0 - max_offset_s, t1 + max_offset_s, 1.0 / grid_hz)
-    b = _z(np.interp(grid_i, t_imu, imu_rate, left=0.0, right=0.0))
-    corr = correlate(b, a, mode="valid")
-    lags = np.arange(len(corr)) / grid_hz - max_offset_s     # IMU sample at t+lag matches cam t
-    k = int(np.argmax(corr))
-    peak = corr[k] / len(a)
-    lag = lags[k]
-    if 0 < k < len(corr) - 1:                      # parabolic sub-sample refinement
-        y0, y1, y2 = corr[k - 1], corr[k], corr[k + 1]
-        den = y0 - 2 * y1 + y2
-        if den != 0:
-            lag += 0.5 * (y0 - y2) / den / grid_hz
-    return float(-lag), float(peak)
+    a = _supported_interp(t_cam, cam_rate, grid, .06)
+    lags = np.arange(-round(max_offset_s*grid_hz), round(max_offset_s*grid_hz)+1) / grid_hz
+    scores = np.full(len(lags), -np.inf)
+    required = max(50, int(np.isfinite(a).sum()*.5))
+    for i, lag in enumerate(lags):
+        b = _supported_interp(t_imu, imu_rate, grid+lag, .02)
+        ok = np.isfinite(a) & np.isfinite(b)
+        if ok.sum() >= required and a[ok].std() > 1e-6 and b[ok].std() > 1e-6:
+            scores[i] = float(np.mean(_z(a[ok])*_z(b[ok])))
+    if not np.isfinite(scores).any():
+        return 0.0, 0.0
+    k = int(np.argmax(scores))
+    return float(-lags[k]), float(np.clip(scores[k], -1, 1))
+

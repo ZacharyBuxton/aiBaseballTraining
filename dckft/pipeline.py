@@ -26,6 +26,7 @@ from .cam_orientation import CamOrientation, camera_angles, camera_orientation, 
 from .markers import MarkerFill, fill_markers, write_outputs as write_marker_outputs
 from .metrics import BLAST_REFERENCE, SwingMetrics, compute_metrics
 from .quality import clean_camera, optical_support
+from .replay_fill import ReplayFill, camera_guided_replay
 from .swing import Swing, detect_swings, detect_swings_imu
 from .sync import axis_rate, estimate_offset
 from .trajectory import Trajectory, build_trajectory
@@ -72,14 +73,26 @@ class SwingResult:
     cam_orient: Optional[CamOrientation] = None
     cam_vs_imu: dict = field(default_factory=dict)
     camera_rejected: int = 0
+    replay: Optional[ReplayFill] = None
+    imu_gaps: int = 0
 
     def diagnostics(self) -> dict:
         e = self.ekf
+        active = (self.traj.t >= self.swing.t_onset) & (self.traj.t <= self.swing.t_end)
         return {
             "time_offset_ms": round(self.time_offset_s * 1e3, 2),
             "sync_correlation": round(self.sync_corr, 3),
             "camera_coverage": round(self.camera_coverage, 3),
             "camera_frames_rejected": self.camera_rejected,
+            "imu_gaps_over_10ms": self.imu_gaps,
+            "replay": ({
+                "estimated_samples": int(self.replay.estimated.sum()),
+                "total_samples": len(self.replay.traj.t),
+                "active_swing_estimated_fraction": float(self.replay.estimated[active].mean())
+                                                    if active.any() else None,
+                "max_distance_to_camera_support_s": round(float(self.replay.nearest_support_s.max()), 4),
+                "method": "camera-anchored replay; IMU/model estimates in optical gaps; metrics remain separate",
+            } if self.replay is not None else None),
             "camera_quaternion_vs_imu": self.cam_vs_imu,
             "swing_end_s": self.swing.t_end,
             "speed_reliable": self.metrics.speed_reliable,
@@ -137,7 +150,47 @@ class SwingResult:
                     w.writerow([round(co.t[k] - self.swing.t_onset, 6), *np.round(co.q[k], 6),
                                 *np.round(co.omega[k], 4),
                                 round(float(np.linalg.norm(co.omega[k])), 4), *np.round(co.axis[k], 5)])
+        self.save_replay(out_dir, bat_cfg)
         return summary
+
+    def save_replay(self, out_dir, bat_cfg):
+        """Same camera-led pose stream for the browser, PNG and downloadable CSV."""
+        if self.replay is None:
+            return
+        rp, sw = self.replay, self.swing
+        tr = rp.traj
+        speed = self.traj.speed(bat_cfg.sweet_spot_s_m)
+        valid = (self.traj.valid.copy() if self.traj.valid is not None else np.ones(len(tr.t), bool))
+        valid &= ~rp.estimated
+        frames = []
+        with open(os.path.join(out_dir, 'replay.csv'), 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['t_s', 'knob_x', 'knob_y', 'knob_z', 'axis_x', 'axis_y', 'axis_z',
+                        'pose_source', 'speed_valid', 'in_swing', 'distance_to_camera_s', 'accel_used'])
+            for i, time_s in enumerate(tr.t):
+                active = sw.t_onset <= time_s <= sw.t_end
+                source = 'imu_estimate' if rp.estimated[i] else 'camera_supported'
+                w.writerow([round(float(time_s-sw.t_onset), 6), *tr.knob[i], *tr.axis[i], source,
+                            int(valid[i]), int(active), round(float(rp.nearest_support_s[i]), 6),
+                            int(rp.accel_used[i])])
+                if sw.t_onset-.1 <= time_s <= sw.t_end:
+                    if not np.isfinite(tr.knob[i]).all() or not np.isfinite(tr.axis[i]).all():
+                        continue
+                    frames.append({
+                        't': round(float(time_s-sw.t_onset), 6),
+                        'knob': np.round(tr.knob[i], 5).tolist(),
+                        'axis': np.round(tr.axis[i], 6).tolist(),
+                        'source': source,
+                        'speed': round(float(speed[i]*2.236936292), 2)
+                                 if valid[i] and active and np.isfinite(speed[i]) else None,
+                        'distance_to_camera_ms': round(float(rp.nearest_support_s[i]*1000), 1),
+                    })
+        with open(os.path.join(out_dir, 'replay.json'), 'w') as f:
+            json.dump({'length_m': bat_cfg.length_m, 'sweet_spot_s_m': bat_cfg.sweet_spot_s_m,
+                       'marker_s_m': bat_cfg.marker_s_m,
+                       'up': np.asarray(self.up).tolist(), 'frames': frames,
+                       'note': 'Pink: camera-supported pose. Orange: IMU/model estimate, not a camera measurement.'},
+                      f, allow_nan=False)
 
 
 def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfig(),
@@ -229,10 +282,12 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
     # ---- trajectory, metrics, coaching
     t1 = time.perf_counter()
     acc_world = acc_valid = None
+    imu_gap = np.r_[False, np.diff(win_imu.t) > .01]
     if cfg.knob_track == "kalman":
         acc_body, acc_valid = merge_accels(win_imu.accel,
                                            win_imu.accel_hg if cfg.imu.use_adxl375 else None, cfg)
         acc_world = Q.rotate(ekf.q, acc_body) + np.asarray(g, float)
+        acc_valid &= ~imu_gap
         # lever arm: the IMU sits imu_s_m up the handle from the knob, so remove the
         # tangential + centripetal terms to get the knob's acceleration
         r_arm = cfg.bat.imu_s_m * ekf.axis
@@ -248,6 +303,10 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
                             marker_s=cfg.bat.marker_s_m, max_gap_s=cfg.swing.max_camera_gap_s)
     traj.valid = optical_support(traj.t, t_cam[np.isfinite(axis_w).all(axis=1)],
                                  cfg.swing.max_camera_gap_s, cfg.swing.reacquire_guard_s)
+    # A display estimate is allowed through a gap; a speed claim is not.
+    for i in np.flatnonzero(imu_gap):
+        guard = cfg.swing.reacquire_guard_s
+        traj.valid[(traj.t >= win_imu.t[i-1]-guard) & (traj.t <= win_imu.t[i]+guard)] = False
     metrics = compute_metrics(traj, ekf.omega_world, sw, cfg.bat, up)
     # Camera-only orientation from the pink centroids: quaternion + its rate (independent check)
     cam_orient, cam_vs_imu = None, {}
@@ -264,14 +323,18 @@ def process_swing(cam: CameraData, imu: ImuData, cfg: FusionConfig = FusionConfi
              else [metrics.speed_note])
     tm["metrics"] = (time.perf_counter() - t1) * 1e3
     marker_fill = fill_markers(traj, cfg.bat, cam.t[cm], {m: p[cm] for m, p in cam.points.items()})
+    replay = camera_guided_replay(traj, t_cam, knob_w, axis_w, acc_world, acc_valid,
+                                 cfg.swing.max_camera_gap_s)
     tm["total"] = (time.perf_counter() - t_start) * 1e3
 
     res = SwingResult(swing=sw, metrics=metrics, notes=notes, traj=traj, ekf=ekf, calib=cal, up=up,
                       time_offset_s=offset, sync_corr=corr, camera_coverage=coverage,
                       timings_ms=tm, cam_t=t_cam, cam_knob=knob_w, cam_axis=axis_w,
                       markers=marker_fill, camera_rejected=rejected,
-                      cam_orient=cam_orient, cam_vs_imu=cam_vs_imu)
+                      cam_orient=cam_orient, cam_vs_imu=cam_vs_imu, replay=replay,
+                      imu_gaps=int(imu_gap.sum()))
     if verbose:
         print(json.dumps(res.diagnostics(), indent=2))
     return res
+
 
