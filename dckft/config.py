@@ -103,6 +103,9 @@ class SwingConfig:
     ring_pre_frames: int = 1200         # 3 s at 400 Hz
     ring_post_frames: int = 1200        # 3 s at 400 Hz
     ring_max_dt_us: float = 3750.0
+    # Web continuous capture uses elapsed time, independent of packet/sample count.
+    capture_pre_s: float = 3.0
+    capture_post_s: float = 3.0
     end_rads: float = 4.0
     min_gap_s: float = 1.5
     pre_roll_s: float = 1.0             # data kept before onset (stance -> calibration)
@@ -176,4 +179,5 @@ def load_config(path: Optional[str] = None) -> FusionConfig:
 def save_config(cfg: FusionConfig, path: str) -> None:
     with open(path, "w") as f:
         json.dump(cfg.to_dict(), f, indent=2)
+
 
