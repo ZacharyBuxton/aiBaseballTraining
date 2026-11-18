@@ -67,7 +67,9 @@ def parse_args():
     p.add_argument("--config", help="JSON config (see config.py)")
     p.add_argument("--save-config", help="Write the effective config to this path and continue")
     p.add_argument("--svo", help="Process a recorded .svo2 instead of the live camera")
+    p.add_argument("--svo-manifest", help="Process the timestamp window in a camera_manifest.json")
     p.add_argument("--record", help="Record the live session to this .svo2 path")
+    p.add_argument("--record-dir", help="With --record-only: continuous SVO parts for IMU-triggered windows")
     p.add_argument("--bat-config", help="dckft config JSON: reuse its bat.marker_s_m as band distances")
     p.add_argument("--record-only", action="store_true",
                    help="With --record: only record (no detection/publishing); fastest capture")
@@ -166,7 +168,14 @@ def main() -> int:
         save_config(cfg, args.save_config)
         print(f"Saved config to {args.save_config}")
 
-    cam = ZedCamera(cfg.camera, svo_path=args.svo)
+    if args.svo and args.svo_manifest:
+        raise ValueError('Use --svo or --svo-manifest, not both')
+    if args.svo_manifest:
+        from svo_sequence import SvoSequence
+        cam = SvoSequence(cfg.camera, args.svo_manifest, ZedCamera)
+        args.svo = args.svo_manifest
+    else:
+        cam = ZedCamera(cfg.camera, svo_path=args.svo)
     try:
         cam.open()
     except CameraError as e:
@@ -174,6 +183,9 @@ def main() -> int:
         return 1
 
     if args.record_only:
+        if args.record_dir and not args.svo:
+            from rolling_record import record_segments
+            return record_segments(cam, cfg, args.record_dir, codec=args.codec)
         if not args.record or args.svo:
             print("[FAIL] --record-only needs --record and a live camera")
             cam.close()
