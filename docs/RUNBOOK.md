@@ -11,8 +11,12 @@ python3 run_app.py                     # on the Orin; add --port /dev/ttyUSB0 --
 Open `http://<orin-ip>:8000` in any browser on the same network (`hostname -I` prints the IP), or
 `http://localhost:8000` on the Orin. The page has four buttons:
 
-- **Start recording**: starts the IMU reader and the camera tracker. Every swing is caught by the ring buffer,
-  processed, rendered and added to the list on its own. Press **Stop** when done.
+- **Record one swing**: choose the camera mode and clip duration. The camera records SVO
+  while the IMU logs CSV. Wait for **RECORDING NOW**, hold still a second, swing once and
+  hold the finish. Recording stops automatically; **Stop** can finalize it early. Detection
+  and fusion begin only after both writers close. There is no hardware ring-buffer gate.
+- The interactive replay uses camera-supported poses in pink and IMU/model gap estimates
+  in orange. A continuous replay does not validate speed in unsupported intervals.
 - **Simulate swing**: runs one simulated swing through the same ring buffer and pipeline. Use it to test with no hardware.
 - **Update from GitHub**: runs `git pull` and restarts the app. The app also pulls once on start (`--no-pull` to skip).
 - Click any swing in the list to see its render, attack angle, vertical bat angle, bat speed and the raw files.
@@ -285,3 +289,4 @@ When the IMU's new firmware (with better timestamps) is ready, add its frame lay
 `dckft/imu/frames.py`. There is a commented example: an ICM-only frame with a 64-bit µs timestamp. Then set
 `imu.frame_format` in the config. Nothing else changes. A 64-bit device timestamp never wraps, and it is mapped onto
 the Jetson clock the same way.
+
