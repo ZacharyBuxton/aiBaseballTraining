@@ -89,15 +89,19 @@ the fusion and from the camera alone, with a camera quaternion built from the pi
 
 `python3 run_app.py` on the Orin, then open `http://<orin-ip>:8000` from any device. Press a button to record, and click
 any swing to see its render with attack angle and vertical bat angle. **Simulate swing** works without hardware, and
-**Update from GitHub** pulls the latest code. Hardware capture records an SVO and the IMU CSV
-first, then processes every saved camera frame offline. Choose 960×600/120 FPS or
-1920×1080/60 FPS and a 5 or 10 second clip. Start, wait for **RECORDING NOW**, hold the
-stance for a second, swing once and hold the finish. Recording stops at the selected
-frame limit; **Stop** finalizes it earlier. Hardware capture does not require the
-strict ring buffer to complete. The browser plays camera-supported poses in pink
-and IMU/model gap estimates in orange; speed validation stays separate. Missing IMU
-data produces an explicit error and preserves the camera recording, never a fabricated
-fused result. See [the web capture workflow](docs/WEB_CAPTURE.md).
+**Update from GitHub** pulls the latest code. Choose 960×600/120 FPS or 1920×1080/60 FPS
+and **Start continuous capture**. Wait for **ARMED**, then swing and hold the finish.
+The configured IMU threshold (default |ω| > 10 rad/s) saves a window **3 seconds before
++ 3 seconds after the rising edge**. Capture continues between swings. Completed
+windows are detected and rendered offline in a queue; **Stop** ends the recording session.
+The time-based web buffer tolerates missing packets while reporting their gaps; it does
+not manufacture missing IMU samples. A manual 5/10-second test clip remains available.
+
+Camera observations anchor the replay in pink, with orange IMU/model estimates in optical
+gaps. The interactive render includes labelled XYZ axes, coordinate readouts, top/front/side
+views, and a supported-speed chart. Speed validation remains separate from pose visibility.
+Raw SVO parts and CSV are retained; absent IMU data cannot produce a fused result.
+See [the web capture workflow](docs/WEB_CAPTURE.md) for exact window bounds and raw replay.
 
 
 ## Quick start
