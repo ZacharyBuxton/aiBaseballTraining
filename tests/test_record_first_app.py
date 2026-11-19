@@ -95,6 +95,7 @@ def test_camera_writers_close_before_detection_and_fusion(backend, monkeypatch):
     monkeypatch.setattr(backend, '_detect_recording', lambda session: events.append('detect'))
     monkeypatch.setattr(backend, '_save_recorded_session', lambda session: events.append('fuse'))
     backend.mode = 'hardware'
+    backend.capture_kind = 'clip'
     backend._hardware_loop()
     assert events == ['closed', 'closed', 'detect', 'fuse']
     assert backend.mode == 'idle' and not backend.busy

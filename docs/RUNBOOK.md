@@ -11,12 +11,14 @@ python3 run_app.py                     # on the Orin; add --port /dev/ttyUSB0 --
 Open `http://<orin-ip>:8000` in any browser on the same network (`hostname -I` prints the IP), or
 `http://localhost:8000` on the Orin. The page has four buttons:
 
-- **Record one swing**: choose the camera mode and clip duration. The camera records SVO
-  while the IMU logs CSV. Wait for **RECORDING NOW**, hold still a second, swing once and
-  hold the finish. Recording stops automatically; **Stop** can finalize it early. Detection
-  and fusion begin only after both writers close. There is no hardware ring-buffer gate.
+- **Start continuous capture** (default): choose the camera mode, then wait for **ARMED**.
+  When the IMU crosses the configured threshold, the app saves three seconds before and
+  three seconds after that edge. The camera and IMU continue between swings. Closed SVO
+  parts for each completed window are detected and rendered in a background queue.
+  **Stop** ends the session and drains the queue. Manual test clips remain available.
 - The interactive replay uses camera-supported poses in pink and IMU/model gap estimates
-  in orange. A continuous replay does not validate speed in unsupported intervals.
+  in orange. Labelled X/Y/Z axes, coordinates and top/front/side views show the path.
+  A continuous replay does not validate speed in unsupported intervals.
 - **Simulate swing**: runs one simulated swing through the same ring buffer and pipeline. Use it to test with no hardware.
 - **Update from GitHub**: runs `git pull` and restarts the app. The app also pulls once on start (`--no-pull` to skip).
 - Click any swing in the list to see its render, attack angle, vertical bat angle, bat speed and the raw files.
@@ -24,7 +26,18 @@ Open `http://<orin-ip>:8000` in any browser on the same network (`hostname -I` p
 Swings are stored in `app_data/swings/<id>/`, which git ignores. The app uses `run_schema_config.json`, the measured
 bat geometry written by `run_schema.py`, when that file exists.
 
-### Ring buffer trigger (from the advisor's Inertial_Sensors_Capture.py)
+### Web trigger: three seconds before and after the threshold
+
+The web app uses `dckft/time_ring.py`: `swing.capture_pre_s = 3` and
+`swing.capture_post_s = 3`, with the existing `swing.trigger_source` and threshold.
+Time is measured from sample timestamps, so 250/380/400 Hz do not change the saved duration.
+Ordinary packet gaps are counted without clearing the pre-roll or inventing samples.
+A device clock restart clears the history; a new quiet sample and pre-roll are required.
+The signal must drop below threshold before another rising edge can trigger.
+An unavailable IMU means no trigger; watch the sample count and status before swinging.
+See [WEB_CAPTURE.md](WEB_CAPTURE.md) for raw-file layouts and timestamp audits.
+
+### Strict sample-count ring (separate streaming CLI and synthetic demo)
 
 `dckft/ring.py` keeps the last 1200 IMU frames (3 s at 400 Hz). When |ω| rises above 10 rad/s, it saves those 1200
 frames plus the next 1200, so each swing is a 6 s window. These rules match the example:

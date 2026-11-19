@@ -93,11 +93,12 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
     if not len(points):
         points = np.vstack([knob[first:last+1], tip[first:last+1]])
     _set_equal(ax, points)
-    ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)"); ax.set_zlabel("up (m)")
+    ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)"); ax.set_zlabel("Z up (m)")
     ax.view_init(elev=18, azim=-60)
     line, = ax.plot([], [], [], color="0.2", lw=5)
     dots, = ax.plot([], [], [], "o", color="deeppink", ms=6)
     status = ax.text2D(.03,.95,"",transform=ax.transAxes,fontsize=11)
+    xyz_label = fig.text(.07,.265,'',fontsize=9,color='0.25')
     axs.plot(trel[first:last+1], shown_speed[first:last+1], color="deeppink", lw=2)
     axs.set_xlabel("Time from swing start (s)"); axs.set_ylabel("Estimated barrel speed (mph)")
     axs.set_xlim(trel[first], trel[last]); axs.grid(alpha=.25)
@@ -130,9 +131,11 @@ def render_swing(result, bat: BatConfig, rcfg: RenderConfig = RenderConfig(),
             source = 'IMU/model gap estimate' if estimated[k] else 'Camera-supported pose'
             speed_text = ('%.1f mph' % speed[k]) if valid[k] and np.isfinite(speed[k]) else 'speed withheld'
             status.set_text('%.3f s | %s\n%s' % (trel[k], source, speed_text))
+            xyz_label.set_text('Barrel XYZ: (%+.3f, %+.3f, %+.3f) m | origin: knob at replay start' % tuple(D(pose.point(bat.sweet_spot_s_m))[k]))
         else:
             line.set_data_3d([],[],[]); dots.set_data_3d([],[],[])
             status.set_text("%.3f s | Tracking gap - pose/speed not shown" % trel[k])
+            xyz_label.set_text('Barrel XYZ unavailable')
         cursor.set_xdata([trel[k],trel[k]])
 
     at = int(np.clip(np.searchsorted(t,m.t_contact),first,last))

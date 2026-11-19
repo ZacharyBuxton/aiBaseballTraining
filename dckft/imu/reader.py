@@ -76,6 +76,7 @@ class CsvSink:
         self.clock = TxClock(frame_format(cfg or ImuConfig()).ts_bits)
         self.tx0 = None
         self.host0 = None
+        self.last_flush = time.monotonic()
 
     def write(self, s: ImuSample) -> None:
         tx = self.clock(s.tx_us)
@@ -86,6 +87,12 @@ class CsvSink:
             *np.round(s.accel, 6), *np.round(s.gyro, 6), *np.round(s.accel_hg, 4),
             *np.round(s.hf, 4), s.ts_ns_host, s.impact_flag,
         ])
+        # The web trigger tails this CSV while capture continues. Do not leave
+        # readiness or threshold events hidden in a large userspace write buffer.
+        now = time.monotonic()
+        if now-self.last_flush >= .1:
+            self.f.flush()
+            self.last_flush = now
 
     def close(self):
         self.f.close()
@@ -143,6 +150,8 @@ def run_serial(cfg: ImuConfig, sinks, max_samples: int = 0, duration_s: float = 
         print(f"Reading {port} @ {cfg.baud} baud. Ctrl+C to stop.")
     try:
         while not stop["flag"]:
+            if duration_s and time.time() - t_start >= duration_s:
+                break
             chunk = ser.read(max(ser.in_waiting, cfg.frame_size))
             if not chunk:
                 continue
@@ -276,3 +285,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

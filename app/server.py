@@ -54,9 +54,12 @@ INDEX = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport co
       <option value="120fps">High FPS: 960 × 600, 120 FPS</option>
       <option value="1080p60">High quality: 1920 × 1080, 60 FPS</option>
     </select></label>
-    <label>Clip length <select id=captureSeconds><option value="5">5 seconds</option>
+    <label>Capture <select id=captureKind onchange="tick()">
+      <option value="triggered">Continuous: IMU trigger, 3 s before + 3 s after</option>
+      <option value="clip">Manual test clip</option></select></label>
+    <label>Test clip length <select id=captureSeconds><option value="5">5 seconds</option>
       <option value="10">10 seconds</option></select></label><br>
-    <button class=primary id=start onclick="post('/api/start')">Record one swing (camera + IMU)</button>
+    <button class=primary id=start onclick="post('/api/start')">Start continuous capture</button>
     <button id=stop onclick="post('/api/stop')">Stop</button>
     <button id=demo onclick="post('/api/demo')">Simulate swing (no hardware)</button>
     <button id=update onclick="update()">Update from GitHub</button>
@@ -69,16 +72,16 @@ INDEX = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport co
 <div class=card><b>Log</b><pre id=log></pre></div>
 </main><script>
 const f=(v,u)=>v===null||v===undefined?'n/a':(v>0&&u=='°'?'+':'')+v.toFixed(1)+u;
-async function post(u){const body=u==='/api/start'?JSON.stringify({capture_mode:captureMode.value,seconds:Number(captureSeconds.value)}):'{}';const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body});const j=await r.json();if(j.message)document.getElementById('msg').textContent=j.message;tick()}
+async function post(u){const body=u==='/api/start'?JSON.stringify({capture_mode:captureMode.value,capture_kind:captureKind.value,seconds:Number(captureSeconds.value)}):'{}';const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body});const j=await r.json();if(j.message)document.getElementById('msg').textContent=j.message;tick()}
 async function update(){if(!confirm('Pull the latest code from GitHub and restart the app?'))return;
  document.getElementById('msg').textContent='Updating...';const r=await fetch('/api/update',{method:'POST'});const j=await r.json();
  alert(j.output||j.message);setTimeout(()=>location.reload(),4000)}
 async function tick(){try{
  const s=await (await fetch('/api/status')).json();
- msg.textContent=s.message+(s.busy?'  (processing...)':'');ring.textContent=s.ring?('Ring buffer: '+s.ring+'  |  frames: IMU '+s.frames.imu+', camera '+s.frames.camera):'';
- trigger.textContent='Record first → detect saved frames → camera-led replay with IMU gap estimates. '+s.trigger;cfg.textContent='Config: '+s.config;
+ msg.textContent=s.message+(s.busy?'  (processing...)':'');ring.textContent=s.ring?('Capture buffer: '+s.ring+'  |  samples: IMU '+s.frames.imu+', camera '+s.frames.camera):'';
+ trigger.textContent=s.trigger;cfg.textContent='Config: '+s.config;
  git.textContent='Code: '+s.git.commit+' ('+s.git.date+') '+s.git.subject;
- captureMode.disabled=captureSeconds.disabled=s.mode!='idle';start.disabled=s.mode!='idle';stop.disabled=s.mode!='hardware';demo.disabled=s.mode!='idle'||s.busy;update.disabled=s.mode!='idle'||s.busy;
+ captureMode.disabled=captureKind.disabled=s.mode!='idle';captureSeconds.disabled=s.mode!='idle'||captureKind.value!='clip';start.textContent=captureKind.value=='triggered'?'Start continuous capture':'Record test clip';start.disabled=s.mode!='idle';stop.disabled=s.mode!='hardware';demo.disabled=s.mode!='idle'||s.busy;update.disabled=s.mode!='idle'||s.busy;
  log.textContent=s.log.join('\\n');
  const w=await (await fetch('/api/swings')).json();
  swings.innerHTML=w.map(x=>`<tr class=row onclick="location='/swing/${x.id}'"><td>${x.created||x.id}</td><td class=src>${x.source||''}</td>
@@ -122,6 +125,12 @@ def swing_page(d: dict) -> str:
               '<input type="range" min="0" max="1" value="0" step="1" aria-label="Replay frame" style="width:55%">'
               '<select aria-label="Playback speed"><option value="0.25">¼ speed</option>'
               '<option value="0.5">½ speed</option><option value="1">Normal speed</option></select>'
+              '<label> View <select class="replay-view" aria-label="Camera view">'
+              '<option value="iso">3D</option><option value="xy">XY (top)</option>'
+              '<option value="xz">XZ (front)</option><option value="yz">YZ (side)</option></select></label>'
+              '<pre class="replay-coordinates"></pre>'
+              '<canvas class="speedplot" style="width:100%;height:170px" aria-label="Camera-supported barrel speed over time"></canvas>'
+              '<p class="muted">Coordinates in metres relative to the knob at replay start: X camera-right, Y horizontal forward, Z up.</p>'
               '<p class="muted">Drag to rotate; scroll to zoom. Pink: camera-supported. '
               'Orange dashed: IMU/model estimate. Camera-supported poses include short interpolation '
               'between observations. Estimated gap motion is excluded from speed validation.</p>'
@@ -143,6 +152,12 @@ def swing_page(d: dict) -> str:
     if estimated is not None:
         quality_text += ' Active-swing replay: %.1f%% camera-supported, %.1f%% estimated.' % (
             100*(1-estimated), 100*estimated)
+    window = meta.get('capture_window') or {}
+    if window:
+        quality_text += ' Trigger window: %.1f s before + %.1f s after the %s threshold (%g).' % (
+            window['pre_s'], window['post_s'], window['trigger_source'], window['threshold'])
+        if window.get('interrupted_post_roll'):
+            quality_text += ' Stop interrupted this window; the post-roll is incomplete.'
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>Swing {sid}</title>
 <style>{STYLE}</style></head><body><main>
@@ -213,7 +228,8 @@ def make_handler(backend: Backend, restart):
                         raise ValueError('Invalid request size')
                     options = json.loads(self.rfile.read(size) or b'{}')
                     ok = backend.start_hardware(options.get('capture_mode', '120fps'),
-                                                options.get('seconds', 5))
+                                                options.get('seconds', 5),
+                                                options.get('capture_kind', 'triggered'))
                 except (ValueError, TypeError, AttributeError) as e:
                     return self._json({'ok': False, 'message': str(e)}, 400)
                 return self._json({"ok": ok, "message": backend.message})
@@ -274,7 +290,7 @@ def serve(backend: Backend, host="0.0.0.0", port=8000, restart=None):
     except KeyboardInterrupt:
         pass
     finally:
-        backend.stop()
+        backend.stop(wait=True)
         httpd.server_close()
     if box["restart"]:
         print("Restarting with the updated code ...")

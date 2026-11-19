@@ -69,6 +69,7 @@ class Backend:
                  cam_config: Optional[str] = None):
         os.makedirs(SWINGS, exist_ok=True)
         self.config_path = config_path
+        self.repo = REPO
         self.cfg: FusionConfig = load_config(config_path)
         self.imu_port, self.cam_config = imu_port, cam_config
         self.lock = threading.Lock()
@@ -81,6 +82,8 @@ class Backend:
         self.thread: Optional[threading.Thread] = None
         self.ring = None
         self.capture_mode = "120fps"
+        self.capture_kind = 'triggered'
+        self.capture_controller = None
         self.capture_seconds = 5.0
         self.session = None
         self.n_frames = {"imu": 0, "camera": 0}
@@ -93,12 +96,14 @@ class Backend:
 
     def status(self) -> dict:
         return {"mode": self.mode, "message": self.message, "busy": self.busy,
-                "ring": (f"{self.ring.progress}, resets from IMU gaps: {self.ring.discontinuities}"
+                "ring": (self.capture_controller.progress() if self.capture_controller is not None else
+                         f"{self.ring.progress}, resets from IMU gaps: {self.ring.discontinuities}"
                          if self.ring is not None else None),
                 "frames": self.n_frames, "log": list(self.log)[-12:],
                 "config": self.config_path or "(defaults: example bat geometry)",
                 "trigger": self._trigger_text(), "session": self.session,
-                "capture_mode": self.capture_mode, "capture_seconds": self.capture_seconds}
+                "capture_mode": self.capture_mode, "capture_seconds": self.capture_seconds,
+                "capture_kind": self.capture_kind}
 
     def _trigger_text(self) -> str:
         s = self.cfg.swing
@@ -106,7 +111,8 @@ class Backend:
             v = f"|omega| > {s.trigger_rads:g} rad/s"
         else:
             v = f"{s.trigger_source} > {s.trigger_accel_ms2:g} m/s^2"
-        return f"{v}; record first, process after capture; no uninterrupted ring window required"
+        return (f"{v}; save {s.capture_pre_s:g} s before + {s.capture_post_s:g} s after threshold; "
+                "continuous camera capture, offline detection of completed windows")
 
     # ------------------------------------------------------------------ swings
     def list_swings(self) -> list:
@@ -237,10 +243,12 @@ class Backend:
             self.mode = "idle"
 
     # ------------------------------------------------------------------ hardware
-    def start_hardware(self, capture_mode="120fps", seconds=5.0) -> bool:
-        """Capture one bounded clip; detection and fusion run only after writers close."""
+    def start_hardware(self, capture_mode="120fps", seconds=5.0, capture_kind='triggered') -> bool:
+        """Continuous IMU-triggered recording by default; manual clips remain available."""
         if capture_mode not in ("120fps", "1080p60"):
             raise ValueError("Choose 120fps or 1080p60")
+        if capture_kind not in ('triggered', 'clip'):
+            raise ValueError('Choose continuous triggered capture or a manual clip')
         seconds = float(seconds)
         if not np.isfinite(seconds) or not 3 <= seconds <= 15:
             raise ValueError("Recording duration must be between 3 and 15 seconds")
@@ -249,18 +257,20 @@ class Backend:
                 self.say(f"Already running ({self.mode}).")
                 return False
             self.capture_mode, self.capture_seconds = capture_mode, seconds
+            self.capture_kind = capture_kind
+            self.capture_controller = None
             self.stop_evt.clear()
             self.mode = "hardware"
             self.thread = threading.Thread(target=self._hardware_loop, daemon=True)
             self.thread.start()
         return True
 
-    def stop(self) -> None:
+    def stop(self, wait=False) -> None:
         if self.mode == "hardware":
             self.stop_evt.set()
-            self.say("Finishing the clip, then processing the saved data ...")
+            self.say("Stopping capture; completing queued swing analysis ...")
         if self.thread and self.thread is not threading.current_thread():
-            self.thread.join(timeout=30)
+            self.thread.join(timeout=None if wait else 30)
         # The worker owns mode/busy until processing has actually finished.
 
     def _start_child(self, name, cmd, session):
@@ -324,6 +334,11 @@ class Backend:
         os.makedirs(session, exist_ok=True)
         self.n_frames = {'imu': 0, 'camera': 0}
         try:
+            if self.capture_kind == 'triggered':
+                from .trigger_capture import TriggerCapture
+                self.capture_controller = TriggerCapture(self, session)
+                self.capture_controller.run()
+                return
             imu_cmd, camera_cmd = self._capture_commands(session)
             self.say('Opening the camera and IMU. Wait for RECORDING NOW before swinging.')
             self._start_child('imu', imu_cmd, session)
@@ -361,31 +376,45 @@ class Backend:
 
     def _detect_recording(self, session):
         cmd = [sys.executable, '-u', os.path.join(REPO, 'Cameras', 'track_bat.py'),
-               '--svo', os.path.join(session, 'camera.svo2'),
+               *(['--svo-manifest', os.path.join(session, 'camera_manifest.json')]
+                 if os.path.isfile(os.path.join(session, 'camera_manifest.json'))
+                 else ['--svo', os.path.join(session, 'camera.svo2')]),
                '--config', os.path.join(session, 'camera_config.json'),
                '--bat-config', os.path.join(session, 'fusion_config.json'),
                '--depth-source', 'stereo', '--no-zmq',
                '--frame-log', os.path.join(session, 'camera_frames.csv'),
                '--jsonl', os.path.join(session, 'camera_session.jsonl')]
-        proc = self._start_child('detection', cmd, session)
-        try:
-            code = proc.wait(timeout=300)
-            if code:
-                raise RuntimeError('Offline detection failed; see detection.log')
-        finally:
-            self._stop_children()
+        nice = shutil.which('nice') if sys.platform.startswith('linux') else None
+        if nice:
+            cmd = [nice, '-n', '10']+cmd
+        # A completed window may be analysed while the live camera/IMU keep running.
+        # Never put this child in the live recorder's process list.
+        with open(os.path.join(session, 'detection.log'), 'w') as log:
+            try:
+                result = subprocess.run(cmd, cwd=REPO, stdout=log, stderr=subprocess.STDOUT,
+                                        timeout=300, start_new_session=True)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError('Offline detection timed out; see detection.log')
+        if result.returncode:
+            raise RuntimeError('Offline detection failed; see detection.log')
 
     def _save_recorded_session(self, session):
         from dckft.data import load_camera_jsonl, load_imu_csv
         from dckft.pipeline import process_swing
         from dckft.swing import detect_swings_imu
         from dckft.render import render_swing
+        window_path = os.path.join(session, 'window.json')
+        window = None
+        if os.path.isfile(window_path):
+            with open(window_path) as f:
+                window = json.load(f)
         cam_path = os.path.join(session, 'camera_session.jsonl')
         cam = load_camera_jsonl(cam_path, list(self.cfg.bat.marker_s_m))
         if len(cam) < 10:
             raise ValueError('Not enough optical positions; inspect detection.log and camera_frames.csv')
         imu = load_imu_csv(os.path.join(session, 'imu_session.csv'))
-        self.n_frames = {'imu': len(imu), 'camera': len(cam)}
+        if not window:
+            self.n_frames = {'imu': len(imu), 'camera': len(cam)}
         if len(imu) < 10:
             raise ValueError('No usable IMU stream. Camera video is saved, but no IMU gap fill is possible')
         swings = [s for s in detect_swings_imu(imu, self.cfg)
@@ -393,8 +422,9 @@ class Backend:
                   and s.t_onset <= cam.t[-1]+self.cfg.sync.max_offset_s]
         if not swings:
             raise ValueError('No swing found during the camera clip. Check IMU mounting/trigger and logs')
-        swing = max(swings, key=lambda s: s.peak_rads)
-        sid = os.path.basename(session)
+        trigger_time = window['trigger_ns']*1e-9 if window else max(swings, key=lambda s: s.peak_rads).t_peak
+        sid = (os.path.basename(os.path.dirname(session))+'_'+os.path.basename(session)
+               if window else os.path.basename(session))
         d = os.path.join(SWINGS, sid)
         os.makedirs(d, exist_ok=True)
         for src, dst in [('imu_session.csv', 'imu.csv'), ('camera_session.jsonl', 'camera.jsonl'),
@@ -402,21 +432,35 @@ class Backend:
                          ('camera_frames.csv', 'camera_frames.csv'),
                          ('capture_frames.csv', 'capture_frames.csv'),
                          ('camera_config.json', 'camera_config.json'),
-                         ('fusion_config.json', 'fusion_config.json')]:
+                         ('fusion_config.json', 'fusion_config.json'),
+                         ('window.json', 'window.json'),
+                         ('camera_manifest.json', 'camera_manifest.json'),
+                         ('camera_manifest.json.meta.json', 'camera_manifest.json.meta.json')]:
             source = os.path.join(session, src)
             if os.path.exists(source):
                 shutil.copy2(source, os.path.join(d, dst))
-        meta = {'created': time.strftime('%Y-%m-%d %H:%M:%S'), 'source': 'hardware (record first)',
+        if window:
+            from .trigger_capture import link_file
+            from pathlib import Path
+            with open(os.path.join(session, 'camera_manifest.json')) as f:
+                parts = json.load(f)['segments']
+            for part in parts:
+                link_file(Path(session)/part['path'], Path(d)/part['path'])
+        meta = {'created': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'source': 'hardware (IMU trigger)' if window else 'hardware (record first)',
                 'session': session, 'imu_frames': len(imu), 'camera_frames': len(cam),
                 'git': git_info()['commit'], 'config': self.config_path or 'defaults',
-                'status': 'processing'}
+                'status': 'processing', 'capture_window': window}
         self._write_meta(d, meta)
         try:
-            res = process_swing(cam, imu, self.cfg, t_trigger=swing.t_peak)
             quality = self._camera_quality(session)
             with open(os.path.join(d, 'camera_quality.json'), 'w') as f:
                 json.dump(quality, f, indent=2)
-            self.n_frames['camera'] = quality['saved_frames']
+            meta['camera_quality'] = quality
+            self._write_meta(d, meta)
+            res = process_swing(cam, imu, self.cfg, t_trigger=trigger_time)
+            if not window:
+                self.n_frames['camera'] = quality['saved_frames']
             res.save(d, self.cfg.bat)
             self.cfg.render.show = False
             render_swing(res, self.cfg.bat, self.cfg.render, d, title=f'Swing {sid}')
@@ -442,10 +486,25 @@ class Backend:
         n = len(times)
         span = float((times[-1]-times[0])/1e9)
         points = np.array([int(r['accepted_3d']) for r in frames])
-        return {'saved_frames': n, 'span_s': span,
+        fps = 0.
+        metadata = os.path.join(session, 'camera_session.jsonl.meta.json')
+        if os.path.isfile(metadata):
+            with open(metadata) as f:
+                fps = float(json.load(f).get('camera', {}).get('fps') or 0)
+        quality = {'saved_frames': n, 'span_s': span,
                 'effective_saved_fps': (n-1)/span if span > 0 else None,
                 'max_frame_gap_ms': float(np.diff(times).max()/1e6) if n > 1 else None,
                 'nonincreasing_timestamps': int((np.diff(times) <= 0).sum()),
                 'frames_with_positions': int((points > 0).sum()),
                 'frames_with_two_or_more_markers': int((points >= 2).sum()),
                 'tracking_fraction_entire_clip': float((points > 0).mean())}
+        quality['estimated_missing_slots_within_recording'] = (
+            int(np.maximum(0, np.rint(np.diff(times)*1e-9*fps).astype(int)-1).sum()) if fps > 0 else None)
+        window_path = os.path.join(session, 'window.json')
+        if os.path.isfile(window_path):
+            with open(window_path) as f:
+                window = json.load(f)
+            quality['requested_window_s'] = (window['end_ns']-window['start_ns'])*1e-9
+            quality['leading_camera_gap_ms'] = max(0., (int(times[0])-window['start_ns'])*1e-6)
+            quality['trailing_camera_gap_ms'] = max(0., (window['end_ns']-int(times[-1]))*1e-6)
+        return quality
